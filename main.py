@@ -518,7 +518,27 @@ def run(
     infer_q = queue.Queue(maxsize=2)
     inf_t   = InferenceThread(CFG, W, H, tts, state)
     inf_t.start(infer_q)
+    log.info("⏳ Waiting for AI models to load and warmup...")
+    max_wait = 90  # Seconds
+    start_warmup = time.time()
+    
+    # We wait until 'perc' (perception) is no longer None in the shared state
+    while True:
+        with state.lock:
+            ready = state.perc is not None
+        
+        if ready:
+            break
+            
+        if time.time() - start_warmup > max_wait:
+            log.error("❌ AI Warmup timed out! Check if models are downloading correctly.")
+            return
 
+        time.sleep(1.0)
+        if int(time.time() - start_warmup) % 5 == 0:
+            log.info(f"   ...still initialising AI ({int(time.time() - start_warmup)}s)...")
+            
+    log.info("🚀 AI is ONLINE. Starting video processing.")
     frame_id      = 0
     fps_smooth    = 0.0
     t_last        = time.perf_counter()
