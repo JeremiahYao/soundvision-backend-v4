@@ -499,6 +499,10 @@ def run(
     log.info(f"  Output : {output_name}")
     log.info("=" * 60)
 
+    # Ensure output directory exists
+    out_dir = Path(CFG.pipeline.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     cap     = FrameCapture(0 if video_path == "0" else video_path)
     W, H    = cap.width, cap.height
     src_fps = cap.fps
@@ -506,7 +510,7 @@ def run(
     log.info(f"Video: {W}×{H} @ {src_fps:.1f} fps  ({cap.total} frames)")
 
     # Output writer
-    out_path = f"{CFG.pipeline.output_dir}/{output_name}.{CFG.pipeline.output_ext}"
+    out_path = str(out_dir / f"{output_name}.{CFG.pipeline.output_ext}")
     fourcc   = cv2.VideoWriter_fourcc(*CFG.pipeline.output_fourcc)
     writer   = cv2.VideoWriter(out_path, fourcc, src_fps, (W, H))
 
@@ -518,27 +522,32 @@ def run(
     infer_q = queue.Queue(maxsize=2)
     inf_t   = InferenceThread(CFG, W, H, tts, state)
     inf_t.start(infer_q)
-    log.info("⏳ Waiting for AI models to load and warmup...")
-    max_wait = 90  # Seconds
-    start_warmup = time.time()
     
-    # We wait until 'perc' (perception) is no longer None in the shared state
+    # --- CRITICAL FIX: AI WARMUP ---
+    log.info("⏳ [Main] Waiting for AI models to initialize (Warmup)...")
+    max_init_wait = 120  
+    start_init_t = time.time()
+    
     while True:
         with state.lock:
-            ready = state.perc is not None
+            # Check if the perception object has processed at least one frame
+            is_ready = state.perc is not None
         
-        if ready:
+        if is_ready:
+            log.info("🚀 [Main] AI Engine is ONLINE. Starting video processing.")
             break
             
-        if time.time() - start_warmup > max_wait:
-            log.error("❌ AI Warmup timed out! Check if models are downloading correctly.")
+        if time.time() - start_init_t > max_init_wait:
+            log.error("❌ [Main] AI Warmup timed out. Check internet/GPU.")
+            inf_t.stop()
+            cap.stop()
             return
 
         time.sleep(1.0)
-        if int(time.time() - start_warmup) % 5 == 0:
-            log.info(f"   ...still initialising AI ({int(time.time() - start_warmup)}s)...")
-            
-    log.info("🚀 AI is ONLINE. Starting video processing.")
+        if int(time.time() - start_init_t) % 5 == 0:
+            log.info(f"   ...loading models ({int(time.time() - start_init_t)}s elapsed)...")
+
+    # --- PROCESSING LOOP ---
     frame_id      = 0
     fps_smooth    = 0.0
     t_last        = time.perf_counter()
@@ -547,10 +556,12 @@ def run(
     log.info(f"Pipeline live. AI every {ai_skip} frames. Press Q to quit.")
 
     try:
-        while not cap.done():
+        # Loop until video ends AND all AI tasks are finished
+        while not (cap.done() and infer_q.empty()):
             frame = cap.read()
             if frame is None:
-                break
+                if cap.done(): break
+                continue
 
             # Feed inference thread (every ai_skip frames)
             if frame_id % ai_skip == 0:
@@ -559,7 +570,7 @@ def run(
                 except queue.Full:
                     pass
 
-            # Snapshot current state (lock-free copy)
+            # Snapshot current state
             with state.lock:
                 perc     = state.perc
                 objects  = list(state.objects)
@@ -567,7 +578,7 @@ def run(
                 threats  = list(state.threats)
                 hud_text = state.hud_text
 
-            # FPS
+            # FPS calculation
             now       = time.perf_counter()
             dt        = now - t_last or 1e-6
             fps_smooth = 0.9 * fps_smooth + 0.1 * (1.0 / dt)
@@ -581,8 +592,6 @@ def run(
                 )
             else:
                 rendered = frame
-                cv2.putText(rendered, "Initialising perception…", (20, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200,200,200), 2)
 
             writer.write(rendered)
 
@@ -594,13 +603,7 @@ def run(
             frame_id += 1
             if frame_id % 150 == 0:
                 pct = f"{frame_id/max(cap.total,1)*100:.1f}%" if cap.total > 0 else f"f{frame_id}"
-                top = threats[0] if threats else None
-                log.info(
-                    f"  [{pct}]  fps={fps_smooth:.1f}"
-                    f"  threats={len(threats)}"
-                    f"  top={top.severity if top else 'CLEAR'}"
-                    f"  skip={ai_skip}"
-                )
+                log.info(f"  [{pct}]  fps={fps_smooth:.1f}  threats={len(threats)}")
 
     except KeyboardInterrupt:
         log.info("Interrupted by user.")
