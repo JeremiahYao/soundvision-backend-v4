@@ -383,33 +383,25 @@ class FrameCapture:
         except queue.Empty:
             return None
 
-   # --- CRITICAL FIX: KICKSTART & WARMUP ---
-    log.info("⏳ [Main] Feeding first frame to start AI Engine...")
-    first_frame = cap.read()
-    if first_frame is not None:
-        # We must give the AI a frame to work on, or it will never be "ready"
-        infer_q.put(first_frame.copy())
-    
-    max_init_wait = 120  
-    start_init_t = time.time()
-    
-    while True:
-        with state.lock:
-            # The engine is ready once the first PerceptionOutput is generated
-            is_ready = state.perc is not None
-        
-        if is_ready:
-            log.info("🚀 [Main] AI Engine is ONLINE. Starting video processing.")
-            break
-            
-        if time.time() - start_init_t > max_init_wait:
-            log.error("❌ [Main] AI Warmup timed out. Ending process.")
-            inf_t.stop()
-            cap.stop()
-            writer.release() 
-            return
+    def done(self) -> bool:
+        return self._done.is_set()
 
-        time.sleep(1.0)
+    def stop(self):
+        self._stop.set()
+        self._t.join(timeout=1.0)
+        self._cap.release()
+
+    def _run(self):
+        while not self._stop.is_set():
+            ret, frame = self._cap.read()
+            if not ret:
+                self._done.set()
+                break
+            
+            # If queue full, pop old and push new
+            if self._q.full():
+                try: self._q.get_nowait()
+                except queue.Empty: pass
             self._q.put(frame)
 
 
@@ -530,14 +522,19 @@ def run(
     inf_t   = InferenceThread(CFG, W, H, tts, state)
     inf_t.start(infer_q)
     
-    # --- CRITICAL FIX: AI WARMUP ---
-    log.info("⏳ [Main] Waiting for AI models to initialize (Warmup)...")
+    # --- CRITICAL FIX: KICKSTART & WARMUP ---
+    log.info("⏳ [Main] Feeding first frame to start AI Engine...")
+    first_frame = cap.read()
+    if first_frame is not None:
+        # We must give the AI a frame to work on, or it will never be "ready"
+        infer_q.put(first_frame.copy())
+    
     max_init_wait = 120  
     start_init_t = time.time()
     
     while True:
         with state.lock:
-            # Check if the perception object has processed at least one frame
+            # The engine is ready once the first PerceptionOutput is generated
             is_ready = state.perc is not None
         
         if is_ready:
@@ -545,9 +542,10 @@ def run(
             break
             
         if time.time() - start_init_t > max_init_wait:
-            log.error("❌ [Main] AI Warmup timed out. Check internet/GPU.")
+            log.error("❌ [Main] AI Warmup timed out. Ending process.")
             inf_t.stop()
             cap.stop()
+            writer.release() 
             return
 
         time.sleep(1.0)
@@ -586,10 +584,10 @@ def run(
                 hud_text = state.hud_text
 
             # FPS calculation
-            now       = time.perf_counter()
-            dt        = now - t_last or 1e-6
+            now        = time.perf_counter()
+            dt         = max(now - t_last, 0.001)
             fps_smooth = 0.9 * fps_smooth + 0.1 * (1.0 / dt)
-            t_last    = now
+            t_last     = now
 
             # HUD render
             if perc is not None:
