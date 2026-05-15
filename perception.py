@@ -251,7 +251,7 @@ class Perception:
         self.height = height
 
         self.detector = SegmentationDetector(
-            cfg.seg.model_path, cfg.seg.conf_threshold, 
+            cfg.seg.model_path, cfg.seg.conf_thresh, 
             cfg.seg.iou_threshold, cfg.seg.obstacle_classes, self.device
         )
         self.depth = DepthEstimator(cfg.depth.model_type, self.device)
