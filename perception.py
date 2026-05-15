@@ -39,7 +39,24 @@ import numpy as np
 import torch
 
 log = logging.getLogger("SV3.Perception")
-
+# --- FIXED: LOCAL YOLO LOADING ---
+        # This looks for the file in the current folder
+self.seg_model = YOLO("yolo11n-seg.pt")
+        
+        # --- FIXED: LOCAL MIDAS LOADING ---
+model_type = "MiDaS_small"
+        # We set pretrained=False so it doesn't try to download from GitHub
+self.midas = torch.hub.load("intel-isl/MiDaS", model_type, pretrained=False)
+        
+try:
+            # Pointing specifically to the file you moved
+    self.midas.load_state_dict(torch.load("midas_weights.pt", map_location=self.device))
+    print("✅ MiDaS local weights loaded successfully.")
+except Exception as e:
+    print(f"⚠️ Local weights failed, trying standard load: {e}")
+    self.midas = torch.hub.load("intel-isl/MiDaS", model_type)
+            
+self.midas.to(self.device).eval()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data structures
