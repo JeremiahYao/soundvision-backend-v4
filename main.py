@@ -383,27 +383,32 @@ class FrameCapture:
         except queue.Empty:
             return None
 
-    log.info("⏳ [Main] Sending first frame for AI Warmup...")
+   # --- CRITICAL FIX: KICKSTART & WARMUP ---
+    log.info("⏳ [Main] Feeding first frame to start AI Engine...")
     first_frame = cap.read()
     if first_frame is not None:
-        infer_q.put(first_frame.copy()) # Give the AI its first task
+        # We must give the AI a frame to work on, or it will never be "ready"
+        infer_q.put(first_frame.copy())
     
     max_init_wait = 120  
     start_init_t = time.time()
     
     while True:
         with state.lock:
+            # The engine is ready once the first PerceptionOutput is generated
             is_ready = state.perc is not None
         
         if is_ready:
-            log.info("🚀 [Main] AI Engine is ONLINE.")
+            log.info("🚀 [Main] AI Engine is ONLINE. Starting video processing.")
             break
             
         if time.time() - start_init_t > max_init_wait:
-            log.error("❌ [Main] AI Warmup timed out.")
+            log.error("❌ [Main] AI Warmup timed out. Ending process.")
             inf_t.stop()
             cap.stop()
+            writer.release() 
             return
+
         time.sleep(1.0)
             self._q.put(frame)
 
