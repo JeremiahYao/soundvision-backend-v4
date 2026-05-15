@@ -383,26 +383,28 @@ class FrameCapture:
         except queue.Empty:
             return None
 
-    def done(self) -> bool:
-        return self._done.is_set()
-
-    def stop(self):
-        self._stop.set()
-        self._t.join(timeout=2.0)
-        self._cap.release()
-
-    def _run(self):
-        while not self._stop.is_set():
-            ret, frame = self._cap.read()
-            if not ret:
-                self._done.set()
-                break
-            # Drop old frame if consumer is behind
-            if self._q.full():
-                try:
-                    self._q.get_nowait()
-                except queue.Empty:
-                    pass
+    log.info("⏳ [Main] Sending first frame for AI Warmup...")
+    first_frame = cap.read()
+    if first_frame is not None:
+        infer_q.put(first_frame.copy()) # Give the AI its first task
+    
+    max_init_wait = 120  
+    start_init_t = time.time()
+    
+    while True:
+        with state.lock:
+            is_ready = state.perc is not None
+        
+        if is_ready:
+            log.info("🚀 [Main] AI Engine is ONLINE.")
+            break
+            
+        if time.time() - start_init_t > max_init_wait:
+            log.error("❌ [Main] AI Warmup timed out.")
+            inf_t.stop()
+            cap.stop()
+            return
+        time.sleep(1.0)
             self._q.put(frame)
 
 
