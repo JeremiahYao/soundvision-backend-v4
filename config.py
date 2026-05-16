@@ -7,9 +7,11 @@ All tunable values live here — no magic numbers elsewhere.
 Architecture: chest-mounted camera, pedestrian navigation.
 """
 
+from __future__ import annotations
+
+import math
 from dataclasses import dataclass, field
-from typing import Dict, Tuple
-import numpy as np
+from typing import Dict, FrozenSet, Tuple
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -21,22 +23,22 @@ class CameraConfig:
     """
     Physical camera parameters for the chest-mount setup.
 
-    chest_height_m : metres above ground — average adult chest ≈ 1.2 m
-    hfov_deg       : horizontal field of view (degrees)
-    vfov_deg       : vertical field of view (degrees)
+    chest_height_m : metres above ground (average adult chest ≈ 1.2 m)
+    hfov_deg       : horizontal FOV in degrees
+    vfov_deg       : vertical FOV in degrees
     mount_tilt_deg : nominal downward tilt of lens from horizontal
                      (positive = looking down; chest mount ≈ 10–15°)
     """
-    chest_height_m:    float = 1.20
-    hfov_deg:          float = 69.0    # common wide-angle mobile lens
-    vfov_deg:          float = 43.0
-    mount_tilt_deg:    float = 12.0    # lens tilted slightly downward
+    chest_height_m:          float = 1.20
+    hfov_deg:                float = 69.0
+    vfov_deg:                float = 43.0
+    mount_tilt_deg:          float = 12.0
 
-    # Auto-calibration: ground-plane horizon search band [top%, bot%] of frame
-    horizon_search_top:  float = 0.25
-    horizon_search_bot:  float = 0.70
+    # Auto-calibration horizon search band (fraction of frame height)
+    horizon_search_top:      float = 0.25
+    horizon_search_bot:      float = 0.75
 
-    # Roll correction: max correctable roll angle in degrees
+    # Maximum correctable roll (degrees) — clamps auto-calibration
     max_roll_correction_deg: float = 20.0
 
 
@@ -49,31 +51,34 @@ class DepthConfig:
     """
     MiDaS depth model configuration and metric scaling parameters.
 
-    MiDaS outputs inverse-relative depth (disparity-like).
-    We convert to metric using:  metric_m = scale / (raw_depth + shift)
-    Scale & shift are estimated per-frame from the ground-plane mask.
+    MiDaS outputs inverse-relative depth d̃ (higher = closer).
+    Metric conversion:  Z_metric = scale / (d̃ + shift)
+
+    scale and shift are estimated per-frame from the ground plane.
     """
-    model_type:       str   = "MiDaS_small"   # "MiDaS_small" | "DPT_Hybrid"
-    input_size:       int   = 256              # resize short side to this
+    # Model: "MiDaS_small" (fast CPU) | "DPT_Hybrid" (accurate GPU)
+    model_type:                  str   = "MiDaS_small"
 
-    # Metric conversion (ground-plane bootstrapped)
-    default_scale:    float = 3.5
-    default_shift:    float = 0.15
+    # Metric conversion priors (ground-calibrated each frame)
+    default_scale:               float = 4.0
+    default_shift:               float = 0.10
 
-    # Savitzky-Golay filter for depth smoothing (per-pixel temporal)
-    sg_window_len:    int   = 7     # must be odd
-    sg_poly_order:    int   = 2
+    # EMA for scale/shift calibration stability
+    calib_ema_alpha:             float = 0.12
 
-    # EMA fallback alpha (lower = smoother, higher = more responsive)
-    ema_alpha:        float = 0.18
+    # Savitzky-Golay temporal smoothing (odd window, degree ≤ window-1)
+    sg_window_len:               int   = 7
+    sg_poly_order:               int   = 2
 
-    # Valid depth range in metres
-    min_depth_m:      float = 0.3
-    max_depth_m:      float = 30.0
+    # EMA fallback alpha (used until SG buffer fills)
+    ema_alpha:                   float = 0.20
 
-    # Ego-motion compensation: depth change threshold below which
-    # the object is considered "stationary relative to observer" (metres/frame)
-    ego_motion_depth_threshold: float = 0.08
+    # Valid metric depth range (metres)
+    min_depth_m:                 float = 0.30
+    max_depth_m:                 float = 25.0
+
+    # Ego-motion compensation threshold (metres/AI-frame)
+    ego_motion_depth_threshold:  float = 0.08
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -83,25 +88,15 @@ class DepthConfig:
 @dataclass(frozen=True)
 class SegmentationConfig:
     """
-    YOLOv11-seg (or YOLOv8-seg) configuration.
-
-    COCO class IDs for each semantic category used by the pipeline.
+    YOLO-seg inference parameters and COCO class groupings.
     """
-    model_path:   str   = "yolo11n-seg.pt"    # falls back to yolov8n-seg.pt
+    model_path:   str   = "yolo11n-seg.pt"   # falls back to yolov8n-seg.pt
     conf_thresh:  float = 0.40
-    iou_thresh:   float = 0.45
+    iou_thresh:   float = 0.45               # NOTE: accessed as cfg.seg.iou_thresh
     input_imgsz:  int   = 640
 
-    # ── COCO class groupings ──────────────────────────────────────────────
-    # Ground-plane classes (define the walkable corridor)
-    GROUND_CLASSES: Tuple[int, ...] = (
-        13,   # bench (proxy for sidewalk furniture)
-    )
-
-    # The actual walkable surface detection relies on low-position heuristics
-    # when explicit segmentation classes are absent; see perception.py.
-
-    # Obstacle classes — objects that can collide with the user
+    # Obstacle classes (COCO-80 IDs → label strings)
+    # NOTE: accessed as cfg.seg.OBSTACLE_CLASSES (upper-case)
     OBSTACLE_CLASSES: Dict[int, str] = field(default_factory=lambda: {
         0:  "person",
         1:  "bicycle",
@@ -111,10 +106,10 @@ class SegmentationConfig:
         7:  "truck",
         9:  "traffic light",
         11: "stop sign",
-        24: "backpack",   # pedestrian proxy when person mask fails
+        24: "backpack",
     })
 
-    # ── Per-class physical dimensions (metres) for metric anchor ─────────
+    # Per-class physical heights (metres) — used as metric-depth anchors
     REAL_HEIGHTS_M: Dict[str, float] = field(default_factory=lambda: {
         "person":        1.75,
         "bicycle":       1.10,
@@ -137,12 +132,11 @@ class RiskConfig:
     """
     Parameters for the vector-intersection risk engine.
 
-    Risk formula (per obstacle):
-        R = (mass_weight * velocity_magnitude * path_intersection_prob) / distance_m
-    Scaled and clamped to [0, 1000].
+    Core formula:
+        R = (mass_weight * velocity_eff * path_intersection) / distance_m
+          * ttc_multiplier * proximity_boost * size_factor
+          * stationary_decay_factor
     """
-
-    # Object mass/danger weights
     HAZARD_WEIGHTS: Dict[str, float] = field(default_factory=lambda: {
         "person":        6.0,
         "bicycle":       9.0,
@@ -156,35 +150,36 @@ class RiskConfig:
         "unknown":       3.0,
     })
 
-    # Severity tier thresholds (raw risk score)
-    TIER_CRITICAL:  float = 300.0
-    TIER_HIGH:      float = 120.0
-    TIER_MEDIUM:    float = 45.0
-    TIER_LOW:       float = 15.0
+    # Severity tier thresholds (risk score units)
+    TIER_CRITICAL:         float = 300.0
+    TIER_HIGH:             float = 120.0
+    TIER_MEDIUM:           float = 45.0
+    TIER_LOW:              float = 15.0
 
     # TTC thresholds (seconds)
-    TTC_CRITICAL_S:  float = 2.5
-    TTC_HIGH_S:      float = 5.0
-    TTC_MEDIUM_S:    float = 10.0
+    TTC_CRITICAL_S:        float = 2.5
+    TTC_HIGH_S:            float = 5.0
+    TTC_MEDIUM_S:          float = 10.0
 
-    # Path corridor width at user position (metres, full width)
-    corridor_width_near_m: float = 0.80   # at 0 m ahead
-    corridor_width_far_m:  float = 1.60   # at max_depth_m ahead
+    # Walking corridor full-width at near / far ends (metres)
+    corridor_width_near_m: float = 0.80
+    corridor_width_far_m:  float = 1.60
 
-    # Stationary suppression: decay factor per frame when object is static
-    stationary_decay: float = 0.92
+    # Stationary suppression
+    stationary_decay:      float = 0.92   # per-frame decay when static
+    stationary_min:        float = 0.20   # floor multiplier (never goes below)
 
-    # EMA for smoothing risk scores (prevents jitter in audio alerts)
-    risk_ema_alpha:   float = 0.35
+    # Risk score EMA smoothing
+    risk_ema_alpha:        float = 0.35
 
-    # Minimum intersection area (fraction of obstacle mask) to trigger risk
+    # Minimum corridor intersection fraction to register as threat
     min_intersection_frac: float = 0.08
 
-    # Velocity estimation window (frames)
-    velocity_window: int = 8
+    # Velocity estimation history window (frames)
+    velocity_window:       int   = 8
 
-    # Score history for trend analysis
-    score_history_len: int = 10
+    # Score history length for trend analysis
+    score_history_len:     int   = 10
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -194,18 +189,15 @@ class RiskConfig:
 @dataclass(frozen=True)
 class GuidanceConfig:
     """Alert cooldown and TTS parameters."""
-
-    # Minimum seconds between spoken alerts per tracked object
     COOLDOWN_S: Dict[str, float] = field(default_factory=lambda: {
         "CRITICAL": 1.5,
         "HIGH":     3.0,
         "MEDIUM":   5.0,
         "LOW":      9.0,
     })
-
-    tts_rate:      int   = 160     # words per minute (pyttsx3)
+    tts_rate:      int   = 160
     clear_msg:     str   = "Path is clear."
-    clear_delay_s: float = 4.0     # wait this long before speaking "clear"
+    clear_delay_s: float = 4.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -215,60 +207,57 @@ class GuidanceConfig:
 @dataclass(frozen=True)
 class PipelineConfig:
     """Threading, frame-skip, and I/O configuration."""
+    inference_queue_size: int   = 2
+    target_ai_fps:        float = 10.0
+    depth_frame_scale:    float = 0.50
 
-    # Async depth inference: runs in parallel thread
-    depth_thread_enabled:   bool  = True
+    # Output video
+    output_fourcc:        str   = "mp4v"
+    output_ext:           str   = "mp4"
+    output_dir:           str   = "/content"
 
-    # Async segmentation: also parallel (requires 2× GPU memory)
-    seg_thread_enabled:     bool  = True
-
-    # Maximum queued frames in inference queues (drop-oldest policy)
-    inference_queue_size:   int   = 2
-
-    # Target AI inference rate (Hz); adaptive skipper adjusts to meet this
-    target_ai_fps:          float = 10.0
-
-    # Performance: resize frame before depth inference
-    depth_frame_scale:      float = 0.50    # 0.5 = half-res for depth model
-
-    # Output
-    output_fourcc:          str   = "XVID"
-    output_ext:             str   = "avi"
-    output_dir:             str   = "/content"
-
-    # Display
-    hud_font_scale:         float = 0.75
-    hud_thickness:          int   = 2
+    # HUD display toggles
+    hud_font_scale:       float = 0.75
+    hud_thickness:        int   = 2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Master config bundle
+# Master Config Bundle
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class Config:
-    camera:      CameraConfig      = field(default_factory=CameraConfig)
-    depth:       DepthConfig       = field(default_factory=DepthConfig)
-    seg:         SegmentationConfig = field(default_factory=SegmentationConfig)
-    risk:        RiskConfig        = field(default_factory=RiskConfig)
-    guidance:    GuidanceConfig    = field(default_factory=GuidanceConfig)
-    pipeline:    PipelineConfig    = field(default_factory=PipelineConfig)
+    """
+    Master configuration bundle.
 
-    # Derived: focal lengths (pixels) computed from FOV + frame size
-    # Call cfg.compute_intrinsics(width, height) before pipeline starts.
+    Call CFG.compute_intrinsics(width, height) once at pipeline startup
+    to derive pixel-space focal lengths from the physical FOV settings.
+    """
+    camera:   CameraConfig       = field(default_factory=CameraConfig)
+    depth:    DepthConfig        = field(default_factory=DepthConfig)
+    seg:      SegmentationConfig = field(default_factory=SegmentationConfig)
+    risk:     RiskConfig         = field(default_factory=RiskConfig)
+    guidance: GuidanceConfig     = field(default_factory=GuidanceConfig)
+    pipeline: PipelineConfig     = field(default_factory=PipelineConfig)
+
+    # Derived pixel-space camera intrinsics (set by compute_intrinsics)
     fx: float = 0.0
     fy: float = 0.0
     cx: float = 0.0
     cy: float = 0.0
 
-    def compute_intrinsics(self, width: int, height: int):
-        """Populate pixel-space camera intrinsics from FOV + resolution."""
-        import math
+    def compute_intrinsics(self, width: int, height: int) -> None:
+        """
+        Populate pixel-space focal lengths from FOV + resolution.
+
+        fx = (W/2) / tan(HFOV/2)
+        fy = (H/2) / tan(VFOV/2)
+        """
         self.fx = (width  / 2.0) / math.tan(math.radians(self.camera.hfov_deg / 2.0))
         self.fy = (height / 2.0) / math.tan(math.radians(self.camera.vfov_deg / 2.0))
         self.cx = width  / 2.0
         self.cy = height / 2.0
 
 
-# Singleton used throughout the pipeline
+# Pipeline-wide singleton — import this from all modules
 CFG = Config()
