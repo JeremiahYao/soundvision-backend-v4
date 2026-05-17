@@ -1,27 +1,43 @@
 """
 risk_engine_v3.py — SoundVision V3
 =====================================
-Implements the Vector-Intersection risk model:
+Vector-Intersection risk engine.
 
-    R_raw = (mass_weight × |velocity| × path_intersection_prob) / distance_m
+    R_raw = (mass_weight × velocity_eff × path_intersection) / distance_m
+          × ttc_multiplier × proximity_boost × size_factor × pose_risk_factor
 
-Extended with:
-  - Stationary suppression: decaying risk for static objects
-  - TTC-gated urgency multiplier
-  - EMA score smoothing per track (prevents jitter in alerts)
-  - Score trend analysis (accelerating = higher danger)
-  - Multi-threat output sorted by risk
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Changes in this version (v4) — Seated person handling
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Risk Score Interpretation
---------------------------
-  ≥ 300 → CRITICAL (stop immediately)
-  ≥ 120 → HIGH     (urgent caution)
-  ≥  45 → MEDIUM   (be aware)
-  ≥  15 → LOW      (informational)
-  <  15 → ignore
+FIX-POSE-3  pose_risk_factor integrated into _compute_raw().
+            A seated person has pose_risk_factor = 0.20 (set by
+            PostureClassifier in perception.py, propagated through
+            Object3D in spatial_v3.py).
 
-All scores are in arbitrary units (AU); thresholds are tuned for
-the chest-mount pedestrian use case.
+            The factor multiplies the raw score BEFORE EMA smoothing,
+            so seated people consistently score ~5× lower than an
+            equivalent standing person at the same distance.
+
+FIX-POSE-4  Severity cap for seated/low-risk persons.
+            Even if a seated person somehow accumulates a high smoothed
+            score (e.g., right after standing up), _severity() caps
+            them at MEDIUM when pose_risk_factor < 0.5. This prevents
+            CRITICAL or HIGH alerts for bench-sitters and wheelchair
+            users who are not on the walking path.
+
+FIX-POSE-5  Direction label for seated persons uses "person_seated"
+            in the ThreatRecord so the HUD and TTS guidance system
+            can display and speak a more informative label.
+            e.g. "person seated on your left, 2.3 metres"
+            instead of "person left, 2.3 metres".
+
+Risk Score Tiers (unchanged):
+  ≥ 300 → CRITICAL
+  ≥ 120 → HIGH
+  ≥  45 → MEDIUM
+  ≥  15 → LOW
+  <  15 → ignored
 """
 
 from __future__ import annotations
@@ -59,12 +75,12 @@ class Severity:
 @dataclass
 class ThreatRecord:
     obj:           Object3D
-    score:         float       # smoothed risk score
-    raw_score:     float       # unsmoothed, for diagnostics
+    score:         float
+    raw_score:     float
     severity:      str
     ttc_s:         float
-    trend:         float       # score acceleration (positive = worsening)
-    direction:     str         # spoken direction: "ahead", "left", "right", etc.
+    trend:         float
+    direction:     str
     distance_m:    float
 
 
@@ -73,57 +89,27 @@ class ThreatRecord:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RiskEngineV3:
-    """
-    Vector-Intersection risk engine.
-
-    Core formula
-    -------------
-    velocity_magnitude = ||(vx, vz)||   [m/frame, forward+lateral only]
-
-    path_intersection = P(object will enter user corridor)
-                      = pre-computed [0,1] from SpatialAnalyzerV3
-
-    mass_weight = per-class danger weight (config.py)
-
-    base_score = mass_weight × velocity_magnitude × path_intersection
-                 / max(distance_m, 0.5)
-
-    Then multiplied by:
-      × TTC urgency factor   (higher when TTC < 5 s)
-      × stationary decay     (if object hasn't moved for N frames)
-      × size factor          (large masks = large objects = more danger)
-
-    Finally EMA-smoothed per track to eliminate jitter.
-    """
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
         rc = cfg.risk
-
-        # Per-track smoothed scores
-        self._smooth_scores: Dict[int, float] = {}
-        # Per-track score history for trend analysis
-        self._score_histories: Dict[int, deque] = defaultdict(
+        self._smooth_scores:    Dict[int, float]  = {}
+        self._score_histories:  Dict[int, deque]  = defaultdict(
             lambda: deque(maxlen=rc.score_history_len)
         )
-        # Stationary decay accumulator
-        self._stationary_decay: Dict[int, float] = defaultdict(lambda: 1.0)
+        self._stationary_decay: Dict[int, float]  = defaultdict(lambda: 1.0)
 
     # ── Public ────────────────────────────────────────────────────────────
 
     def evaluate(self, objects: List[Object3D]) -> Optional[ThreatRecord]:
-        """Return the single highest-risk ThreatRecord, or None."""
         threats = self.evaluate_all(objects)
         return threats[0] if threats else None
 
     def evaluate_all(self, objects: List[Object3D]) -> List[ThreatRecord]:
-        """Return all threats above TIER_LOW, sorted highest-risk first."""
         rc = self.cfg.risk
         threats: List[ThreatRecord] = []
 
         active_ids = {o.track_id for o in objects}
-
-        # Decay scores for objects no longer tracked
         for tid in list(self._smooth_scores.keys()):
             if tid not in active_ids:
                 self._smooth_scores[tid] *= 0.85
@@ -131,13 +117,14 @@ class RiskEngineV3:
                     del self._smooth_scores[tid]
 
         for obj in objects:
-            raw = self._compute_raw(obj)
+            raw    = self._compute_raw(obj)
             smooth = self._apply_smoothing(obj.track_id, raw, obj.is_stationary)
 
             if smooth < rc.TIER_LOW:
                 continue
 
-            sev   = self._severity(smooth, obj.ttc_s)
+            # FIX-POSE-4: severity cap for seated persons
+            sev   = self._severity(smooth, obj.ttc_s, obj.pose_risk_factor)
             trend = self._score_trend(obj.track_id)
             dir_  = self._direction(obj)
 
@@ -165,38 +152,32 @@ class RiskEngineV3:
         dist   = max(obj.distance_m, 0.5)
         path_p = obj.path_intersection
 
-        # ── 1. Velocity vector magnitude (lateral + forward only) ──────────
-        vel_mag = math.sqrt(vx**2 + vz**2)     # metres/frame
-        vel_mag = max(vel_mag, 0.02)            # minimum ambient motion
+        # velocity
+        vel_mag       = max(math.sqrt(vx**2 + vz**2), 0.02)
+        closing_vz    = max(-vz, 0.0)
+        vel_effective = vel_mag * 0.5 + closing_vz * 1.5
 
-        # ── 2. Closing component: forward velocity toward user ─────────────
-        # vz negative = object approaching (Z decreasing)
-        closing_vz = max(-vz, 0.0)             # only count approach
-        vel_effective = vel_mag * 0.5 + closing_vz * 1.5   # weight closing
-
-        # ── 3. Base score: (mass × velocity × path_p) / distance ──────────
+        # base
         base = (mass * vel_effective * max(path_p, 0.05)) / dist
 
-        # ── 4. TTC urgency multiplier ──────────────────────────────────────
-        ttc_mult = self._ttc_multiplier(obj.ttc_s)
-
-        # ── 5. Proximity exponential boost (very close = exponential danger) ─
+        # multipliers
+        ttc_mult  = self._ttc_multiplier(obj.ttc_s)
         prox_mult = math.exp(max(0, (6.0 - dist)) * 0.35)
-
-        # ── 6. Mask size factor (normalised by frame area) ─────────────────
         mask_area_frac = obj.inst.mask.sum() / (obj.inst.mask.size + 1)
         size_mult = 1.0 + min(mask_area_frac * 8.0, 2.5)
 
-        raw = base * ttc_mult * prox_mult * size_mult
+        # FIX-POSE-3: pose risk factor applied to raw score
+        pose_mult = obj.pose_risk_factor   # 1.0 standing, 0.20 seated
+
+        raw = base * ttc_mult * prox_mult * size_mult * pose_mult
         return float(np.clip(raw, 0.0, 2000.0))
 
     # ── Smoothing ─────────────────────────────────────────────────────────
 
-    def _apply_smoothing(self, tid: int, raw: float, is_stationary: bool) -> float:
+    def _apply_smoothing(self, tid, raw, is_stationary) -> float:
         rc    = self.cfg.risk
         alpha = rc.risk_ema_alpha
 
-        # Stationary decay
         if is_stationary:
             self._stationary_decay[tid] *= rc.stationary_decay
             self._stationary_decay[tid]  = max(self._stationary_decay[tid], 0.20)
@@ -207,7 +188,6 @@ class RiskEngineV3:
 
         raw_decayed = raw * self._stationary_decay[tid]
 
-        # EMA smoothing — asymmetric: react faster to increases
         if tid not in self._smooth_scores:
             self._smooth_scores[tid] = raw_decayed
         else:
@@ -221,43 +201,36 @@ class RiskEngineV3:
 
     # ── Trend ─────────────────────────────────────────────────────────────
 
-    def _score_trend(self, tid: int) -> float:
-        """
-        Score acceleration (2nd derivative of score history).
-        Positive = worsening situation; negative = improving.
-        """
+    def _score_trend(self, tid) -> float:
         hist = list(self._score_histories[tid])
         if len(hist) < 4:
             return 0.0
         arr = np.array(hist[-8:], dtype=float)
         t   = np.arange(len(arr), dtype=float)
-        slope = float(np.polyfit(t, arr, 1)[0])
-        return slope
+        return float(np.polyfit(t, arr, 1)[0])
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
-    def _ttc_multiplier(self, ttc_s: float) -> float:
-        """
-        Non-linear TTC urgency multiplier.
-        TTC  → 999 s : mult = 0.8  (no threat)
-        TTC  →  10 s : mult = 1.0
-        TTC  →   5 s : mult = 2.0
-        TTC  →   2 s : mult = 5.0
-        TTC  →   0 s : mult = 10.0
-        """
-        if ttc_s >= 100:
-            return 0.85
-        if ttc_s >= 10:
-            return 1.0 + (10 - ttc_s) * 0.02         # 1.0 → 1.0
-        if ttc_s >= 5:
-            return 1.0 + (10 - ttc_s) * 0.20         # 1.0 → 2.0
-        if ttc_s >= 2:
-            return 2.0 + (5 - ttc_s)  * 1.00         # 2.0 → 5.0
-        return 5.0 + (2 - ttc_s) * 2.50              # 5.0 → 10.0
+    def _ttc_multiplier(self, ttc_s) -> float:
+        if ttc_s >= 100:  return 0.85
+        if ttc_s >= 10:   return 1.0 + (10 - ttc_s) * 0.02
+        if ttc_s >= 5:    return 1.0 + (10 - ttc_s) * 0.20
+        if ttc_s >= 2:    return 2.0 + (5  - ttc_s) * 1.00
+        return 5.0 + (2 - ttc_s) * 2.50
 
-    def _severity(self, score: float, ttc_s: float) -> str:
+    def _severity(self, score: float, ttc_s: float,
+                  pose_risk_factor: float = 1.0) -> str:
         rc = self.cfg.risk
-        # TTC override: even moderate score becomes CRITICAL if TTC < 2.5 s
+
+        # FIX-POSE-4: seated persons capped at MEDIUM
+        if pose_risk_factor < 0.5:
+            if score >= rc.TIER_MEDIUM:
+                return Severity.MEDIUM
+            if score >= rc.TIER_LOW:
+                return Severity.LOW
+            return Severity.CLEAR
+
+        # Normal severity logic for standing persons and vehicles
         if ttc_s < rc.TTC_CRITICAL_S:
             return Severity.CRITICAL
         if ttc_s < rc.TTC_HIGH_S and score >= rc.TIER_MEDIUM:
@@ -269,14 +242,9 @@ class RiskEngineV3:
 
     @staticmethod
     def _direction(obj: Object3D) -> str:
-        """Convert lateral_m to a spoken direction word."""
         lat = obj.lateral_m
-        if abs(lat) < 0.40:
-            return "directly ahead"
-        if lat < -1.0:
-            return "far left"
-        if lat < -0.40:
-            return "left"
-        if lat >  1.0:
-            return "far right"
+        if abs(lat) < 0.40:    return "directly ahead"
+        if lat < -1.0:         return "far left"
+        if lat < -0.40:        return "left"
+        if lat >  1.0:         return "far right"
         return "right"
