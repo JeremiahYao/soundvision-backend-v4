@@ -6,31 +6,44 @@ Unified perception class that runs:
   2. MiDaS        → monocular depth map (metric-calibrated)
   3. Risk Heatmap → depth map masked by obstacle pixels only
 
-─────────────────────────────────────────────────────────────
-GHOST DETECTION FIX  (this version)
-─────────────────────────────────────────────────────────────
-Root cause of ghost detections:
-  track_id was set to `i` (enumerate loop index) from YOLO.
-  On every new frame, YOLO re-numbers boxes from 0 upward.
-  If a real object disappears and a new one appears in the
-  same frame slot, it inherits the OLD object's depth/velocity
-  history from SpatialAnalyzerV3, producing fabricated TTC
-  values and spurious risk scores ("ghosts").
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Changes in this version (v4)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Fixes applied:
-  FIX-GHOST-1  IoU-based identity matching between frames so
-               track_id is stable across frames, not re-indexed.
-  FIX-GHOST-2  Confirmation gate: a detection must appear in
-               MIN_CONFIRM_FRAMES consecutive frames before it
-               is passed downstream to the risk engine.
-               Single-frame blips (shadows, reflections, YOLO
-               noise) are silently dropped.
-  FIX-GHOST-3  Raised per-class confidence thresholds above the
-               global floor for classes that ghost most often
-               (person, backpack) where YOLO hallucinates on
-               texture/shadow.
-  FIX-GHOST-4  Mask sanity check: masks smaller than 0.05% of
-               frame area are discarded (sub-pixel noise masks).
+FIX-MISS-1  Person confidence threshold lowered from 0.55 → 0.42.
+            The 0.55 value introduced in the ghost-fix was too aggressive
+            and caused missed detections for partially occluded or
+            motion-blurred people. 0.42 keeps ghost suppression while
+            restoring sensitivity.
+
+FIX-MISS-2  TRACK_IOU_THRESH split into per-class values.
+            Fast-moving people can shift their bbox significantly between
+            AI frames, causing IoU to drop below 0.25 → tracker treating
+            each frame as a new object → never reaching MIN_CONFIRM_FRAMES.
+            Person IOU gate lowered to 0.15; vehicles remain at 0.25.
+
+FIX-MISS-3  MIN_CONFIRM_FRAMES lowered from 3 → 2.
+            3 frames at 10Hz AI = 300ms minimum latency before any alert.
+            2 frames = 200ms — still filters single-frame ghosts but reacts
+            faster to real pedestrians.
+
+FIX-MISS-4  Immediate-confirm bypass for close, on-path objects.
+            If a new detection is estimated to be within 4m AND its bbox
+            centre is in the middle third of the frame (directly ahead),
+            it is confirmed in 1 frame. This catches the "person steps out
+            directly in front" scenario that MIN_CONFIRM_FRAMES delays.
+
+FIX-POSE-1  Seated person classifier (new: PostureClassifier).
+            Uses three complementary signals:
+              a) Bounding-box aspect ratio  (bbox_w / bbox_h > 0.80 → likely seated)
+              b) Estimated real-world height from depth + bbox_h via pinhole model
+                 (est_height_m < 1.10m at distance → seated/crouching)
+              c) Mask centre-of-mass position relative to horizon
+                 (seated people's mask CoM is very low in the frame)
+            Any detection classified as seated gets:
+              - label changed to "person_seated"
+              - pose_risk_factor = 0.20 (stored in InstanceMask)
+              - Severity capped at LOW by risk_engine_v3.py
 """
 
 from __future__ import annotations
@@ -48,31 +61,46 @@ log = logging.getLogger("SV3.Perception")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tuning constants for ghost suppression
+# Tracker tuning  (per-class IoU gates)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# How many consecutive frames a detection must appear before it's "real"
-MIN_CONFIRM_FRAMES: int = 3
+# FIX-MISS-2: per-class IoU gate (lower = more lenient matching)
+TRACK_IOU_THRESH_BY_CLASS: Dict[str, float] = {
+    "person":        0.15,   # people move fast between AI frames
+    "bicycle":       0.18,
+    "car":           0.28,
+    "motorcycle":    0.20,
+    "bus":           0.30,
+    "truck":         0.30,
+    "traffic light": 0.30,
+    "stop sign":     0.35,
+    "backpack":      0.20,
+}
+TRACK_IOU_THRESH_DEFAULT: float = 0.22
 
-# IoU threshold to consider two boxes the same object across frames
-TRACK_IOU_THRESH: float = 0.25
+# FIX-MISS-3: confirmation frames
+MIN_CONFIRM_FRAMES: int = 2
 
-# Per-class minimum confidence (overrides global cfg.seg.conf_thresh)
-# Higher values for classes that hallucinate most on shadows/textures
+# FIX-MISS-4: immediate-confirm thresholds
+IMMEDIATE_CONFIRM_DIST_M:   float = 4.0    # metres — objects this close bypass gate
+IMMEDIATE_CONFIRM_CENTRE_F: float = 0.33   # middle third of frame width
+
+# FIX-GHOST: per-class minimum confidence
+# Lowered person to 0.42 (was 0.55 — too aggressive, caused missed detections)
 PER_CLASS_CONF: Dict[str, float] = {
-    "person":        0.55,   # raised — most common ghost class
-    "bicycle":       0.50,
-    "car":           0.50,
-    "motorcycle":    0.50,
-    "bus":           0.50,
-    "truck":         0.50,
-    "traffic light": 0.55,
-    "stop sign":     0.55,
-    "backpack":      0.60,   # raised — very common false positive
+    "person":        0.42,   # FIX-MISS-1: was 0.55
+    "bicycle":       0.45,
+    "car":           0.48,
+    "motorcycle":    0.45,
+    "bus":           0.48,
+    "truck":         0.48,
+    "traffic light": 0.50,
+    "stop sign":     0.50,
+    "backpack":      0.55,   # kept high — still very ghost-prone
 }
 
-# Minimum mask area as a fraction of total frame pixels
-MIN_MASK_AREA_FRAC: float = 0.0005   # 0.05% — kills sub-pixel ghost masks
+# Minimum mask area fraction (keeps ghost suppression)
+MIN_MASK_AREA_FRAC: float = 0.0004
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -82,12 +110,15 @@ MIN_MASK_AREA_FRAC: float = 0.0005   # 0.05% — kills sub-pixel ghost masks
 @dataclass
 class InstanceMask:
     """One detected obstacle with its segmentation mask and metadata."""
-    label:    str
-    cls_id:   int
-    conf:     float
-    bbox:     Tuple[int, int, int, int]   # x1, y1, x2, y2
-    mask:     np.ndarray                  # bool H×W
-    track_id: int = -1
+    label:            str
+    cls_id:           int
+    conf:             float
+    bbox:             Tuple[int, int, int, int]   # x1, y1, x2, y2
+    mask:             np.ndarray                  # bool H×W
+    track_id:         int   = -1
+    # FIX-POSE-1: pose risk multiplier (1.0 = standing, 0.20 = seated)
+    pose_risk_factor: float = 1.0
+    is_seated:        bool  = False
 
 
 @dataclass
@@ -109,11 +140,90 @@ class PerceptionOutput:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# IoU-based Frame-to-Frame Tracker
+# Posture Classifier  (FIX-POSE-1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PostureClassifier:
+    """
+    Classifies detected persons as standing or seated using three signals:
+
+    Signal A — Bounding-box aspect ratio
+        bbox_w / bbox_h:
+          > 0.80 → strong seated indicator (person is wide relative to height)
+          < 0.50 → strong standing indicator
+
+    Signal B — Estimated real-world height
+        Using the pinhole model:  h_world = (bbox_h_px / fy) * depth_m
+        If h_world < SEATED_HEIGHT_THRESH_M → likely seated
+
+    Signal C — Mask centre-of-mass below horizon
+        If the mask CoM is very close to the bottom of the bounding box
+        (< 25% from the bottom), the person occupies only the lower portion
+        of their bbox, consistent with being seated behind an obstacle (bench,
+        car window) or crouching.
+
+    A person is classified as seated when at least 2 of the 3 signals agree.
+    """
+
+    SEATED_ASPECT_RATIO:    float = 0.78   # bbox_w/bbox_h above this → seated signal
+    SEATED_HEIGHT_THRESH_M: float = 1.10   # estimated real height below this → seated
+    SEATED_COM_FRAC:        float = 0.30   # CoM in bottom fraction of bbox → seated
+
+    def classify(
+        self,
+        inst:        InstanceMask,
+        depth_smooth: np.ndarray,
+        fy:          float,
+        horizon_y:   int,
+        frame_h:     int,
+        frame_w:     int,
+    ) -> Tuple[bool, float]:
+        """
+        Returns (is_seated: bool, pose_risk_factor: float).
+        pose_risk_factor = 1.0 for standing, 0.20 for seated.
+        Only applied to 'person' class; all other classes return (False, 1.0).
+        """
+        if inst.label != "person":
+            return False, 1.0
+
+        x1, y1, x2, y2 = inst.bbox
+        bbox_w = max(x2 - x1, 1)
+        bbox_h = max(y2 - y1, 1)
+
+        signals_seated = 0
+
+        # ── Signal A: aspect ratio ────────────────────────────────────────
+        aspect = bbox_w / bbox_h
+        if aspect > self.SEATED_ASPECT_RATIO:
+            signals_seated += 1
+
+        # ── Signal B: estimated real-world height ─────────────────────────
+        if fy > 0 and inst.mask.any():
+            median_depth = float(np.median(depth_smooth[inst.mask]))
+            if median_depth > 0.1:
+                est_height_m = (bbox_h / fy) * median_depth
+                if est_height_m < self.SEATED_HEIGHT_THRESH_M:
+                    signals_seated += 1
+
+        # ── Signal C: mask CoM position in bbox ───────────────────────────
+        rows, cols = np.where(inst.mask)
+        if len(rows) > 0:
+            com_y  = float(rows.mean())
+            # How far down in the bbox is the CoM?  0=top, 1=bottom
+            com_frac_in_bbox = (com_y - y1) / bbox_h
+            if com_frac_in_bbox > (1.0 - self.SEATED_COM_FRAC):
+                signals_seated += 1
+
+        is_seated = signals_seated >= 2
+        pose_risk_factor = 0.20 if is_seated else 1.0
+        return is_seated, pose_risk_factor
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IoU helper
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _box_iou(a: Tuple[int,int,int,int], b: Tuple[int,int,int,int]) -> float:
-    """Intersection-over-Union of two (x1,y1,x2,y2) boxes."""
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
     ix1 = max(ax1, bx1); iy1 = max(ay1, by1)
@@ -121,36 +231,37 @@ def _box_iou(a: Tuple[int,int,int,int], b: Tuple[int,int,int,int]) -> float:
     inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
     if inter == 0:
         return 0.0
-    area_a = max(1, (ax2 - ax1) * (ay2 - ay1))
-    area_b = max(1, (bx2 - bx1) * (by2 - by1))
+    area_a = max(1, (ax2-ax1)*(ay2-ay1))
+    area_b = max(1, (bx2-bx1)*(by2-by1))
     return inter / (area_a + area_b - inter)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Stable IoU Tracker  (ghost suppression + FIX-MISS fixes)
+# ─────────────────────────────────────────────────────────────────────────────
+
 @dataclass
 class _TrackEntry:
-    """Internal tracker state for one persistent object."""
-    track_id:     int
-    label:        str
-    bbox:         Tuple[int, int, int, int]
-    hits:         int = 1          # consecutive frames seen
-    missed:       int = 0          # consecutive frames missed
-    confirmed:    bool = False     # True once hits >= MIN_CONFIRM_FRAMES
+    track_id:  int
+    label:     str
+    bbox:      Tuple[int, int, int, int]
+    hits:      int  = 1
+    missed:    int  = 0
+    confirmed: bool = False
 
 
 class StableTracker:
     """
-    Lightweight IoU-based tracker that gives each physical object a
-    stable integer track_id across frames.
+    IoU-based frame-to-frame tracker with:
+      - Per-class IoU thresholds (FIX-MISS-2)
+      - Reduced confirmation window (FIX-MISS-3)
+      - Immediate-confirm bypass for close/central threats (FIX-MISS-4)
 
-    FIX-GHOST-1: Prevents track_id recycling by matching detections
-    to existing tracks via IoU before assigning IDs.
-
-    FIX-GHOST-2: Only returns detections once they have been seen in
-    MIN_CONFIRM_FRAMES consecutive frames, eliminating single-frame
-    hallucinations.
+    Ghost suppression is preserved: single-frame blips still need 2 hits
+    unless they are within IMMEDIATE_CONFIRM_DIST_M directly ahead.
     """
 
-    MAX_MISSED = 5   # frames before a track is deleted
+    MAX_MISSED = 6
 
     def __init__(self):
         self._tracks:  Dict[int, _TrackEntry] = {}
@@ -159,88 +270,108 @@ class StableTracker:
     def update(
         self,
         raw_detections: List[InstanceMask],
+        depth_smooth:   Optional[np.ndarray] = None,
+        frame_w:        int = 640,
     ) -> List[InstanceMask]:
         """
-        Match raw_detections to existing tracks.
-        Returns only CONFIRMED detections with stable track_ids.
+        Returns confirmed detections with stable track_ids.
+        depth_smooth is used for the immediate-confirm distance estimate.
         """
-        # ── Step 1: age all tracks (assume missed this frame) ─────────────
+        # Age all tracks
         for t in self._tracks.values():
             t.missed += 1
 
-        # ── Step 2: greedy IoU matching (highest IoU pair first) ──────────
-        matched_track_ids: set = set()
-        matched_det_idxs:  set = set()
+        matched_tids: set = set()
+        matched_dis:  set = set()
+        track_ids = list(self._tracks.keys())
 
-        track_ids  = list(self._tracks.keys())
-
-        for _ in range(len(raw_detections)):
-            best_iou  = TRACK_IOU_THRESH
-            best_ti   = -1
-            best_di   = -1
+        # Greedy IoU matching — per-class threshold
+        for _ in range(max(len(track_ids), len(raw_detections))):
+            best_iou = -1.0
+            best_ti  = -1
+            best_di  = -1
 
             for ti, tid in enumerate(track_ids):
-                if tid in matched_track_ids:
+                if tid in matched_tids:
                     continue
                 t = self._tracks[tid]
+                thresh = TRACK_IOU_THRESH_BY_CLASS.get(
+                    t.label, TRACK_IOU_THRESH_DEFAULT
+                )
                 for di, det in enumerate(raw_detections):
-                    if di in matched_det_idxs:
+                    if di in matched_dis:
                         continue
                     if det.label != t.label:
                         continue
                     iou = _box_iou(det.bbox, t.bbox)
-                    if iou > best_iou:
+                    if iou >= thresh and iou > best_iou:
                         best_iou = iou
                         best_ti  = ti
                         best_di  = di
 
             if best_di == -1:
-                break   # no more matchable pairs above threshold
+                break
 
             tid = track_ids[best_ti]
-            det = raw_detections[best_di]
             t   = self._tracks[tid]
-
-            t.bbox   = det.bbox
+            t.bbox   = raw_detections[best_di].bbox
             t.hits  += 1
             t.missed  = 0
             t.confirmed = t.confirmed or (t.hits >= MIN_CONFIRM_FRAMES)
+            matched_tids.add(tid)
+            matched_dis.add(best_di)
 
-            matched_track_ids.add(tid)
-            matched_det_idxs.add(best_di)
-
-        # ── Step 3: unmatched detections → new tracks ─────────────────────
+        # Unmatched → new tracks
         for di, det in enumerate(raw_detections):
-            if di not in matched_det_idxs:
+            if di not in matched_dis:
                 tid = self._next_id
                 self._next_id += 1
                 self._tracks[tid] = _TrackEntry(
-                    track_id = tid,
-                    label    = det.label,
-                    bbox     = det.bbox,
-                    hits     = 1,
+                    track_id=tid, label=det.label, bbox=det.bbox, hits=1
                 )
 
-        # ── Step 4: delete stale tracks ───────────────────────────────────
-        stale = [tid for tid, t in self._tracks.items()
-                 if t.missed > self.MAX_MISSED]
-        for tid in stale:
+        # Evict stale tracks
+        for tid in [t for t, e in self._tracks.items() if e.missed > self.MAX_MISSED]:
             del self._tracks[tid]
 
-        # ── Step 5: build output — only confirmed, non-missed tracks ──────
-        # Build a map from bbox→track for confirmed tracks seen this frame
-        confirmed_out: List[InstanceMask] = []
+        # FIX-MISS-4: immediate-confirm bypass
+        if depth_smooth is not None:
+            for tid, t in self._tracks.items():
+                if t.confirmed or t.missed > 0:
+                    continue
+                x1, y1, x2, y2 = t.bbox
+                cx_px   = (x1 + x2) / 2.0
+                centre_frac = abs(cx_px / frame_w - 0.5)  # 0 = dead centre
+                if centre_frac < IMMEDIATE_CONFIRM_CENTRE_F / 2.0:
+                    # Estimate depth at bbox centre
+                    cy_px  = int((y1 + y2) / 2)
+                    cx_int = int(cx_px)
+                    h_d, w_d = depth_smooth.shape
+                    cy_px  = max(0, min(cy_px, h_d - 1))
+                    cx_int = max(0, min(cx_int, w_d - 1))
+                    est_depth = float(depth_smooth[cy_px, cx_int])
+                    if est_depth < IMMEDIATE_CONFIRM_DIST_M:
+                        t.confirmed = True
+                        log.debug(
+                            f"[Tracker] Immediate-confirm tid={tid} "
+                            f"label={t.label} depth={est_depth:.1f}m"
+                        )
+
+        # Build output: confirmed + not-missed
+        out: List[InstanceMask] = []
         for tid, t in self._tracks.items():
             if not t.confirmed or t.missed > 0:
                 continue
-            # Find the matching raw detection to get mask/conf
             for det in raw_detections:
-                if det.label == t.label and _box_iou(det.bbox, t.bbox) >= TRACK_IOU_THRESH:
+                thresh = TRACK_IOU_THRESH_BY_CLASS.get(
+                    t.label, TRACK_IOU_THRESH_DEFAULT
+                )
+                if det.label == t.label and _box_iou(det.bbox, t.bbox) >= thresh:
                     det.track_id = tid
-                    confirmed_out.append(det)
+                    out.append(det)
                     break
 
-        return confirmed_out
+        return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -263,8 +394,7 @@ class DepthEstimator:
             if model_type == "DPT_Hybrid"
             else transforms.small_transform
         )
-        dummy = np.zeros((256, 256, 3), dtype=np.uint8)
-        self._infer(dummy)
+        self._infer(np.zeros((256, 256, 3), dtype=np.uint8))
         log.info("[DepthEstimator] Warmup complete.")
 
     @torch.inference_mode()
@@ -288,12 +418,6 @@ class DepthEstimator:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MetricCalibrator:
-    """
-    Converts MiDaS inverse-relative depth d̃ to metric depth Z (metres).
-    Model:  Z = scale / (d̃ + shift)
-    scale is estimated per-frame using ground-plane geometry.
-    """
-
     def __init__(self, default_scale, default_shift, calib_ema_alpha,
                  camera_height_m, fy):
         self._scale     = default_scale
@@ -349,19 +473,15 @@ class DepthSmoother:
             self._ema = depth_metric.copy()
         else:
             self._ema = self._alpha * depth_metric + (1.0 - self._alpha) * self._ema
-
         if not self._use_sg:
             return self._ema.astype(np.float32)
-
         self._buf.append(depth_metric.copy())
         if len(self._buf) > self._win:
             self._buf.pop(0)
-
         if len(self._buf) == self._win:
             stack    = np.stack(self._buf, axis=0)
             smoothed = np.einsum("t,thw->hw", self._sg_coeffs, stack)
             return np.clip(smoothed, 0.3, 25.0).astype(np.float32)
-
         return self._ema.astype(np.float32)
 
 
@@ -393,7 +513,6 @@ class GroundPlaneDetector:
 
         ground_mask = np.zeros((h, w), dtype=bool)
         ground_mask[y0:y1, :] = cleaned
-
         horizon_y, roll_deg = self._fit_horizon(ground_mask, h, w)
         return ground_mask, horizon_y, roll_deg
 
@@ -419,15 +538,10 @@ class GroundPlaneDetector:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SegmentationDetector:
-    """
-    FIX-GHOST-3: Per-class confidence thresholds (higher for ghost-prone classes).
-    FIX-GHOST-4: Mask area sanity check rejects sub-pixel noise masks.
-    """
-
     def __init__(self, cfg, device: torch.device):
         from ultralytics import YOLO
         self._obstacle_classes: Dict[int, str] = cfg.seg.OBSTACLE_CLASSES
-        self._conf   = cfg.seg.conf_thresh      # global floor
+        self._conf   = cfg.seg.conf_thresh
         self._iou    = cfg.seg.iou_thresh
         self._device = str(device)
 
@@ -438,8 +552,7 @@ class SegmentationDetector:
             log.warning("[SegDet] Fallback to yolov8n-seg.pt")
             self.model = YOLO("yolov8n-seg.pt")
 
-        dummy = np.zeros((640, 640, 3), dtype=np.uint8)
-        self._run(dummy)
+        self._run(np.zeros((640, 640, 3), dtype=np.uint8))
         log.info("[SegDet] Warmup complete.")
 
     def detect(self, frame: np.ndarray) -> List[InstanceMask]:
@@ -470,22 +583,17 @@ class SegmentationDetector:
                 continue
 
             conf_val = float(box.conf[0])
-
-            # FIX-GHOST-3: enforce per-class minimum confidence
             min_conf = PER_CLASS_CONF.get(label, self._conf)
             if conf_val < min_conf:
                 continue
 
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-
             raw_mask     = masks_data[i]
             mask_resized = cv2.resize(
                 raw_mask, (w, h), interpolation=cv2.INTER_NEAREST
             ).astype(bool)
 
-            # FIX-GHOST-4: reject tiny/noisy masks
-            mask_area = int(mask_resized.sum())
-            if mask_area < frame_pixels * MIN_MASK_AREA_FRAC:
+            if mask_resized.sum() < frame_pixels * MIN_MASK_AREA_FRAC:
                 continue
 
             out.append(InstanceMask(
@@ -494,7 +602,7 @@ class SegmentationDetector:
                 conf     = conf_val,
                 bbox     = (x1, y1, x2, y2),
                 mask     = mask_resized,
-                track_id = -1,   # assigned by StableTracker, not here
+                track_id = -1,
             ))
 
         return out
@@ -511,9 +619,11 @@ def _build_risk_heatmap(depth_metric, obstacle_masks, ground_mask, hazard_weight
     for inst in obstacle_masks:
         if not inst.mask.any():
             continue
-        w_val  = hazard_weights.get(inst.label, 3.0)
+        base_w = hazard_weights.get(inst.label, 3.0)
+        # Apply pose_risk_factor to seated persons in heatmap too
+        effective_w = base_w * inst.pose_risk_factor
         d_px   = depth_metric[inst.mask]
-        danger = np.clip(w_val / (d_px + 0.5), 0.0, w_val)
+        danger = np.clip(effective_w / (d_px + 0.5), 0.0, effective_w)
         heatmap[inst.mask] = np.maximum(heatmap[inst.mask], danger)
     heatmap = np.clip(heatmap / max_w, 0.0, 1.0)
     heatmap[ground_mask] = 0.0
@@ -526,12 +636,11 @@ def _build_risk_heatmap(depth_metric, obstacle_masks, ground_mask, hazard_weight
 
 class Perception:
     """
-    Synchronous perception pipeline with ghost-detection suppression.
+    Synchronous perception pipeline.
 
-    Ghost suppression layers (in order):
-      1. Per-class confidence threshold  (SegmentationDetector)
-      2. Minimum mask area check         (SegmentationDetector)
-      3. IoU-based frame-to-frame tracking + confirmation gate (StableTracker)
+    Ghost suppression:    StableTracker with confirmation gate
+    Missed person fix:    Lower conf threshold, per-class IoU, immediate-confirm
+    Seated person fix:    PostureClassifier tags persons with pose_risk_factor
     """
 
     def __init__(self, cfg, width: int, height: int):
@@ -550,9 +659,8 @@ class Perception:
             cfg.depth.sg_poly_order,
             cfg.depth.ema_alpha,
         )
-
-        # FIX-GHOST-1/2: stable IoU tracker with confirmation gate
-        self._tracker = StableTracker()
+        self._tracker  = StableTracker()
+        self._posture  = PostureClassifier()
 
         from config import CFG
         self._calibrator = MetricCalibrator(
@@ -591,15 +699,25 @@ class Perception:
         # 4. Temporal smoothing
         depth_smooth = self._smoother.update(depth_metric)
 
-        # 5. Segmentation (raw detections)
+        # 5. Segmentation (raw detections, unconfirmed)
         raw_masks = self._seg_det.detect(frame)
 
-        # 6. FIX-GHOST: stable tracking + confirmation gate
-        obstacle_masks = self._tracker.update(raw_masks)
+        # 6. Stable tracking + confirmation gate (FIX-MISS-2/3/4)
+        confirmed = self._tracker.update(raw_masks, depth_smooth, w)
 
-        # 7. Risk heatmap
+        # 7. Posture classification (FIX-POSE-1)
+        for inst in confirmed:
+            seated, prf = self._posture.classify(
+                inst, depth_smooth, CFG.fy, horizon_y, h, w
+            )
+            inst.is_seated        = seated
+            inst.pose_risk_factor = prf
+            if seated:
+                inst.label = "person_seated"
+
+        # 8. Risk heatmap
         heatmap = _build_risk_heatmap(
-            depth_metric, obstacle_masks, ground_mask,
+            depth_metric, confirmed, ground_mask,
             self.cfg.risk.HAZARD_WEIGHTS,
         )
 
@@ -610,7 +728,7 @@ class Perception:
             depth_metric   = depth_metric,
             depth_smooth   = depth_smooth,
             ground_mask    = ground_mask,
-            obstacle_masks = obstacle_masks,
+            obstacle_masks = confirmed,
             risk_heatmap   = heatmap,
             horizon_y      = horizon_y,
             roll_deg       = roll_deg,
