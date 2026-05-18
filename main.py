@@ -11,26 +11,23 @@ High-performance asynchronous pipeline:
                                             ↓
   Main Thread reads PipelineState → HUDRenderer → VideoWriter
 
-Fixes / upgrades vs. previous version
+Fixes applied vs. previous version
 ---------------------------------------
-  FIX-6   TTSEngine: broken __new__ bypass when tts_enabled=False.
-           Now uses a proper NullTTS stub so speak() is always safe.
-  FIX-7   PipelineState: List fields use field(default_factory=list)
-           instead of = None to satisfy dataclass typing rules.
-  FIX-10  Warmup log spam: tracks last-logged second to avoid
-           printing on every loop iteration within the same second.
-  FIX-11  Alert templates: rewritten to be grammatically correct
-           with the rich direction phrases from describe_direction().
-           Previous templates produced broken sentences like
-           "approaching from directly ahead" when direction already
-           encodes motion ("ahead, approaching fast").
-  FIX-12  Secondary-threat audio: when the top threat has cleared its
-           cooldown but a second CRITICAL/HIGH threat exists, a brief
-           secondary alert is queued after the primary.
-  FIX-13  "Path clear" is now spoken only after a MEDIUM-or-above
-           threat clears, and is suppressed if a new threat arrives
-           within clear_delay_s. Previously it could fire
-           spuriously during very brief track gaps.
+  FIX-6   TTSEngine: proper NullTTS stub — speak() always safe.
+  FIX-7   PipelineState: List fields use field(default_factory=list).
+  FIX-10  Warmup log spam suppressed.
+  FIX-11  Templates rewritten for correct grammar with motion-aware
+          direction phrases.
+  FIX-12  Secondary-threat audio for simultaneous CRITICAL/HIGH threats.
+  FIX-13  "Path clear" suppressed during brief tracking gaps.
+  FIX-14  Navigation-grade audio:
+           - Relatable distance language ("arm's reach", "2 steps")
+           - Multi-obstacle count ("3 people blocking your path")
+           - Avoidance instruction ("move right", "stop and wait")
+           - Scene summary for situational awareness
+  FIX-15  Stationary-obstacle velocity floor: stationary objects inside
+          the corridor get a minimum closing velocity equal to the user's
+          own walking speed, so they are never silently ignored.
 
 Usage
 ------
@@ -44,12 +41,12 @@ from __future__ import annotations
 import argparse
 import logging
 import queue
-import sys
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -68,42 +65,154 @@ log = logging.getLogger("SV3.Main")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Alert templates  — FIX-11
-#
-# Design rules:
-#   1. {direction} already encodes motion ("ahead, approaching fast",
-#      "on your left, crossing toward you") so templates must NOT add
-#      redundant motion words like "approaching from" before it.
-#   2. Sentences must be grammatically complete.
-#   3. CRITICAL templates are short (≤8 words spoken) — blind user
-#      needs to react, not parse a paragraph.
-#   4. TTC is shown only when < 10 s and rounds to integer seconds.
-#   5. Templates rotate per-track (idx cycles) to avoid repetition fatigue.
+# Human-relatable distance language  (FIX-14)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _distance_phrase(dist_m: float, cfg: Config) -> str:
+    """
+    Convert a metric distance to a human-relatable spoken phrase.
+
+    Uses the DISTANCE_PHRASES config dict (sorted by upper bound).
+    Beyond the largest key: returns "far ahead".
+
+    Examples:
+      0.5 m → "right in front of you"
+      1.0 m → "very close"
+      1.8 m → "close"
+      3.0 m → "nearby"
+      5.0 m → "ahead"
+      9.0 m → "in the distance"
+     20.0 m → "far ahead"
+    """
+    for upper_m, phrase in sorted(cfg.guidance.DISTANCE_PHRASES.items()):
+        if dist_m <= upper_m:
+            return phrase
+    return "far ahead"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Avoidance instruction generator  (FIX-14)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _avoidance_instruction(threats: List[ThreatRecord]) -> str:
+    """
+    Generate a short, actionable instruction based on the spatial layout
+    of ALL active threats. This answers "what should I do?" not just "what's there?".
+
+    Strategy:
+      - If path blocked left AND right → "Stop — path blocked."
+      - If threats mostly left         → "Move right."
+      - If threats mostly right        → "Move left."
+      - Single centred CRITICAL        → "Stop."
+      - HIGH centred, close            → "Slow down."
+      - Otherwise                      → "" (description is sufficient)
+
+    lateral_m convention: negative = left of user, positive = right.
+    """
+    if not threats:
+        return ""
+
+    left_count   = sum(1 for t in threats if t.obj.lateral_m < -0.25)
+    right_count  = sum(1 for t in threats if t.obj.lateral_m >  0.25)
+    centre_count = sum(1 for t in threats if abs(t.obj.lateral_m) <= 0.25)
+
+    top_sev  = threats[0].severity
+    top_dist = threats[0].distance_m
+
+    if top_sev == Severity.CRITICAL:
+        if left_count > 0 and right_count > 0:
+            return "Stop — path blocked."
+        if left_count > 0:
+            return "Move right."
+        if right_count > 0:
+            return "Move left."
+        return "Stop."
+
+    if top_sev == Severity.HIGH:
+        if left_count > right_count:
+            return "Bear right."
+        if right_count > left_count:
+            return "Bear left."
+        if centre_count >= 1 and top_dist < 2.0:
+            return "Slow down."
+        return "Caution."
+
+    if top_sev == Severity.MEDIUM:
+        if left_count > right_count and right_count == 0:
+            return "Keep right."
+        if right_count > left_count and left_count == 0:
+            return "Keep left."
+
+    return ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-obstacle scene summary  (FIX-14)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _scene_summary(threats: List[ThreatRecord], cfg: Config) -> str:
+    """
+    Compact spoken scene description when multiple threats exist.
+    Fires only when there are 2+ threats at MEDIUM or above.
+
+    Examples:
+      "3 people in your path."
+      "Person and bicycle close."
+      "2 people close, car nearby."
+    """
+    significant = [
+        t for t in threats
+        if t.severity in (Severity.CRITICAL, Severity.HIGH, Severity.MEDIUM)
+    ]
+    if len(significant) < 2:
+        return ""
+
+    counts: Counter = Counter(t.obj.label for t in significant)
+    parts = []
+    for label, count in counts.most_common():
+        if count == 1:
+            parts.append(label)
+        elif label.endswith("s"):
+            parts.append(f"{count} {label}")
+        else:
+            parts.append(f"{count} {label}s")
+
+    if len(parts) == 1:
+        label_str = parts[0]
+    elif len(parts) == 2:
+        label_str = f"{parts[0]} and {parts[1]}"
+    else:
+        label_str = ", ".join(parts[:-1]) + f", and {parts[-1]}"
+
+    dist_phrase = _distance_phrase(significant[0].distance_m, cfg)
+    return f"{label_str} {dist_phrase}."
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Alert templates  (FIX-11 + FIX-14)
 # ─────────────────────────────────────────────────────────────────────────────
 
 TEMPLATES = {
     Severity.CRITICAL: [
-        "Stop! {label} {direction}!",
-        "Danger! {label} {direction}, {dist:.0f} metres.",
-        "Stop now — {label} {direction}.",
-        "Collision risk! {label} {direction}{ttc_clause}.",
+        "Stop! {label} {direction}. {action}",
+        "Danger — {label} {direction}, {dist_phrase}. {action}",
+        "Stop now! {label} {direction}{ttc_clause}. {action}",
+        "{label} {direction}, {dist_phrase}. {action}",
     ],
     Severity.HIGH: [
-        "Warning: {label} {direction}, {dist:.1f} metres.",
-        "Caution — {label} {direction}{ttc_clause}.",
-        "Watch out: {label} {direction}, {dist:.1f} metres.",
+        "Warning: {label} {direction}, {dist_phrase}. {action}",
+        "Caution — {label} {direction}{ttc_clause}. {action}",
+        "Watch out: {label} {direction}, {dist_phrase}. {action}",
     ],
     Severity.MEDIUM: [
-        "{label} {direction}, {dist:.1f} metres.",
-        "Heads up — {label} {direction}, {dist:.1f} metres away.",
+        "{label} {direction}, {dist_phrase}.",
+        "Heads up — {label} {direction}, {dist_phrase}.",
     ],
     Severity.LOW: [
-        "{label} {direction}, {dist:.1f} metres.",
+        "{label} {direction}.",
     ],
 }
 
-# Short secondary-threat addendum (appended to primary message when a
-# second significant threat exists): FIX-12
 SECONDARY_TEMPLATES = [
     "Also: {label} {direction}.",
     "{label} {direction} as well.",
@@ -127,25 +236,30 @@ SEVERITY_BGR = {
 
 
 def _fmt_ttc(ttc_s: float) -> str:
-    """Return ', TTC N seconds' only when TTC is meaningful (< 10 s)."""
     if ttc_s < 10.0:
         return f", {ttc_s:.0f} seconds"
     return ""
 
 
-def _render_template(template: str, threat: ThreatRecord) -> str:
-    """
-    Safely render one alert template string.
-
-    All format keys are pre-computed here to avoid KeyError if a template
-    variant references a field the previous template didn't.
-    """
-    return template.format(
-        label      = threat.obj.label,
-        direction  = threat.direction,
-        dist       = threat.distance_m,
-        ttc_clause = _fmt_ttc(threat.ttc_s),
-    )
+def _render_template(
+    template: str,
+    threat: ThreatRecord,
+    dist_phrase: str,
+    action: str,
+) -> str:
+    rendered = template.format(
+        label       = threat.obj.label,
+        direction   = threat.direction,
+        dist_phrase = dist_phrase,
+        ttc_clause  = _fmt_ttc(threat.ttc_s),
+        action      = action,
+    ).strip()
+    while "  " in rendered:
+        rendered = rendered.replace("  ", " ")
+    rendered = rendered.replace(". .", ".").replace("!.", "!").strip()
+    if not rendered.endswith((".", "!", "?")):
+        rendered += "."
+    return rendered
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -156,76 +270,71 @@ class GuidanceSystem:
     """
     Decides what to speak and when, based on the ranked threat list.
 
-    Key behaviours:
-      - Per-track cooldowns prevent the same object from being announced
-        more than once per cooldown window.
-      - Escalation bypass: if a track's severity suddenly jumps to CRITICAL
-        from non-CRITICAL/HIGH, the cooldown is ignored.
-      - Secondary alert (FIX-12): after the primary message, if a second
-        CRITICAL or HIGH threat exists with no recent announcement, a short
-        addendum is queued.
-      - "Path clear" (FIX-13): only fires after a MEDIUM-or-above threat
-        has cleared, and is suppressed if a new threat arrives quickly.
+    Full spoken output structure (FIX-14):
+      [scene summary if 2+ threats]  →  [primary alert + action]  →  [secondary]
+
+    Example:
+      "2 people and a bicycle close.
+       Stop! Person ahead, approaching fast. Move right.
+       Also: bicycle on your left."
     """
 
-    # Minimum severity that triggers a "path clear" message after it leaves
-    _CLEAR_MIN_SEVERITY = {Severity.MEDIUM, Severity.HIGH, Severity.CRITICAL}
+    _CLEAR_MIN_SEVERITY       = {Severity.MEDIUM, Severity.HIGH, Severity.CRITICAL}
+    _SCENE_SUMMARY_COOLDOWN_S = 10.0
 
     def __init__(self, cfg: Config):
-        self.cfg            = cfg
-        self._cooldown:     dict = {}    # tid → last-spoken time
-        self._tpl_idx:      dict = {}    # tid → template rotation index
-        self._last_sev:     dict = {}    # tid → last severity spoken
-        self._spoke_clear         = True
-        self._last_clear_t        = 0.0
-        self._prev_top_sev        = Severity.CLEAR
-        self._secondary_cooldown: dict = {}   # tid → last secondary-spoken time
+        self.cfg                    = cfg
+        self._cooldown:      Dict   = {}
+        self._tpl_idx:       Dict   = {}
+        self._last_sev:      Dict   = {}
+        self._secondary_cd:  Dict   = {}
+        self._spoke_clear           = True
+        self._last_clear_t          = 0.0
+        self._prev_top_sev          = Severity.CLEAR
+        self._last_scene_summary_t  = 0.0
 
     def generate_speak(self, threats: List[ThreatRecord]) -> Optional[str]:
-        """
-        Given the full sorted threat list, return the string to speak
-        (or None if nothing should be said right now).
-
-        Combines primary message + optional secondary addendum into one
-        TTS call so pyttsx3 speaks them without an inter-call gap.
-        """
         now = time.monotonic()
         top = threats[0] if threats else None
 
-        # ── No threats at all: maybe announce clear ────────────────────────
         if top is None:
             return self._maybe_speak_clear(now)
 
         self._spoke_clear = False
 
-        # ── Primary threat ─────────────────────────────────────────────────
-        primary_msg = self._primary_message(top, now)
+        # Scene summary
+        scene = ""
+        if (
+            len(threats) >= 2
+            and now - self._last_scene_summary_t > self._SCENE_SUMMARY_COOLDOWN_S
+        ):
+            scene = _scene_summary(threats, self.cfg)
+            if scene:
+                self._last_scene_summary_t = now
 
-        # ── Secondary threat addendum (FIX-12) ────────────────────────────
-        secondary_msg = None
-        if primary_msg and len(threats) >= 2:
-            secondary_msg = self._secondary_message(threats[1], now)
+        # Primary
+        avoidance = _avoidance_instruction(threats)
+        primary   = self._primary_message(top, avoidance, now)
 
-        if primary_msg is None:
-            # Check if a secondary that bypassed cooldown warrants standalone
-            # announcement — only for CRITICAL
+        # Secondary
+        secondary = ""
+        if primary and len(threats) >= 2:
+            secondary = self._secondary_message(threats[1], now)
+
+        if primary is None:
             if len(threats) >= 2 and threats[1].severity == Severity.CRITICAL:
-                secondary_msg = self._primary_message(threats[1], now)
-                return secondary_msg
-
+                msg = self._primary_message(threats[1], avoidance, now)
+                self._prev_top_sev = threats[1].severity
+                return msg
             self._prev_top_sev = top.severity
             return None
 
         self._prev_top_sev = top.severity
 
-        if secondary_msg:
-            return primary_msg + "  " + secondary_msg
-        return primary_msg
-
-    # ── Internal helpers ───────────────────────────────────────────────────
+        parts = [p for p in [scene, primary, secondary] if p]
+        return "  ".join(parts)
 
     def _maybe_speak_clear(self, now: float) -> Optional[str]:
-        """FIX-13: only speak clear if a significant threat recently left."""
         if (
             not self._spoke_clear
             and self._prev_top_sev in self._CLEAR_MIN_SEVERITY
@@ -236,7 +345,9 @@ class GuidanceSystem:
             return self.cfg.guidance.clear_msg
         return None
 
-    def _primary_message(self, threat: ThreatRecord, now: float) -> Optional[str]:
+    def _primary_message(
+        self, threat: ThreatRecord, avoidance: str, now: float
+    ) -> Optional[str]:
         sev = threat.severity
         tid = threat.obj.track_id
 
@@ -248,47 +359,47 @@ class GuidanceSystem:
         self._last_sev[tid] = sev
 
         cooldown = self.cfg.guidance.COOLDOWN_S.get(sev, 5.0)
-        last_t   = self._cooldown.get(tid, 0.0)
-        if not escalated and (now - last_t) < cooldown:
+        if not escalated and (now - self._cooldown.get(tid, 0.0)) < cooldown:
             return None
 
         self._cooldown[tid] = now
-
         templates = TEMPLATES[sev]
         idx = self._tpl_idx.get(tid, 0) % len(templates)
         self._tpl_idx[tid] = idx + 1
 
-        return _render_template(templates[idx], threat)
+        dist_phrase = _distance_phrase(threat.distance_m, self.cfg)
+        return _render_template(templates[idx], threat, dist_phrase, avoidance)
 
-    def _secondary_message(self, threat: ThreatRecord, now: float) -> Optional[str]:
-        """
-        Short addendum for the second-highest threat, only if significant
-        and not recently announced.  Uses a shorter cooldown than primary.
-        """
+    def _secondary_message(self, threat: ThreatRecord, now: float) -> str:
         if threat.severity not in (Severity.CRITICAL, Severity.HIGH):
-            return None
-
+            return ""
         tid      = threat.obj.track_id
         cooldown = max(self.cfg.guidance.COOLDOWN_S.get(threat.severity, 5.0) * 0.5, 2.0)
-        last_t   = self._secondary_cooldown.get(tid, 0.0)
-        if now - last_t < cooldown:
-            return None
+        if now - self._secondary_cd.get(tid, 0.0) < cooldown:
+            return ""
+        self._secondary_cd[tid] = now
+        idx  = self._tpl_idx.get(tid, 0) % len(SECONDARY_TEMPLATES)
+        return SECONDARY_TEMPLATES[idx].format(
+            label     = threat.obj.label,
+            direction = threat.direction,
+        )
 
-        self._secondary_cooldown[tid] = now
-        idx = self._tpl_idx.get(tid, 0) % len(SECONDARY_TEMPLATES)
-        tmpl = SECONDARY_TEMPLATES[idx]
-        return tmpl.format(label=threat.obj.label, direction=threat.direction)
-
-    def hud_text(self, top: Optional[ThreatRecord]) -> str:
+    def hud_text(self, threats: List[ThreatRecord]) -> str:
+        top = threats[0] if threats else None
         if top is None:
             return f"{SEVERITY_ICON[Severity.CLEAR]} Path clear."
+
         icon      = SEVERITY_ICON.get(top.severity, "")
         ttc_str   = f"  TTC {top.ttc_s:.1f}s" if top.ttc_s < 60 else ""
         trend_str = "↑" if top.trend > 2 else ("↓" if top.trend < -2 else "")
+        dist_p    = _distance_phrase(top.distance_m, self.cfg)
+        n         = len(threats)
+        count_str = f"  ({n} threats)" if n > 1 else ""
+
         return (
             f"{icon} {top.obj.label.upper()} — {top.direction}"
-            f"  |  {top.distance_m:.1f}m{ttc_str}"
-            f"  |  risk {top.score:.0f} {trend_str}"
+            f"  |  {dist_p} ({top.distance_m:.1f}m){ttc_str}"
+            f"  |  risk {top.score:.0f} {trend_str}{count_str}"
         )
 
 
@@ -297,19 +408,12 @@ class GuidanceSystem:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _NullTTS:
-    """
-    Silent TTS stub used when tts_enabled=False.
-    FIX-6: replaces the broken TTSEngine.__new__() bypass that left
-           _q and _engine uninitialised, causing AttributeError on speak().
-    """
     def speak(self, text: str) -> None:
         print(f"[AUDIO] {text}")
 
 
 class TTSEngine:
-    """Live TTS using pyttsx3 (falls back to printing if unavailable)."""
-
-    def __init__(self, rate: int = 160):
+    def __init__(self, rate: int = 145):
         self._q: queue.Queue = queue.Queue(maxsize=3)
         self._engine = None
         try:
@@ -327,7 +431,7 @@ class TTSEngine:
         try:
             self._q.put_nowait(text)
         except queue.Full:
-            pass   # drop if TTS is already busy — safety > completeness
+            pass
 
     def _run(self) -> None:
         while True:
@@ -343,12 +447,7 @@ class TTSEngine:
 
 
 def _make_tts(enabled: bool, rate: int):
-    """
-    FIX-6: factory that always returns an object with a safe speak() method.
-    """
-    if enabled:
-        return TTSEngine(rate)
-    return _NullTTS()
+    return TTSEngine(rate) if enabled else _NullTTS()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -384,37 +483,28 @@ class HUDRenderer:
 
         if self.show_depth and perc.depth_smooth is not None:
             self._overlay_depth(out, perc.depth_smooth, w, h)
-
         if self.show_heatmap and perc.risk_heatmap is not None:
             self._overlay_heatmap(out, perc.risk_heatmap)
-
         if perc.ground_mask is not None and perc.ground_mask.any():
-            gm_color = np.zeros_like(out)
-            gm_color[perc.ground_mask] = (0, 80, 0)
-            cv2.addWeighted(out, 1.0, gm_color, 0.25, 0, out)
-
+            gm = np.zeros_like(out)
+            gm[perc.ground_mask] = (0, 80, 0)
+            cv2.addWeighted(out, 1.0, gm, 0.25, 0, out)
         if self.show_corridor and corridor is not None:
             self._draw_corridor(out, corridor)
-
         for threat in threats:
             self._draw_obstacle(out, threat)
 
         hy = perc.horizon_y
         cv2.line(out, (0, hy), (w, hy), (200, 200, 0), 1, cv2.LINE_AA)
-        cv2.putText(
-            out, f"horizon  roll {perc.roll_deg:+.1f}deg",
-            (8, max(hy - 5, 12)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 0), 1, cv2.LINE_AA,
-        )
+        cv2.putText(out, f"horizon  roll {perc.roll_deg:+.1f}deg",
+                    (8, max(hy - 5, 12)), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.38, (200, 200, 0), 1, cv2.LINE_AA)
 
         top_sev    = threats[0].severity if threats else Severity.CLEAR
         banner_col = SEVERITY_BGR.get(top_sev, (60, 60, 60))
         self._draw_banner(out, hud_text, banner_col, w)
         self._draw_stats(out, fps, frame_id, perc, threats, w, h)
-
         return out
-
-    # ── Sub-renders ───────────────────────────────────────────────────────
 
     def _overlay_depth(self, frame, depth, w, h):
         mini_h, mini_w = 120, 180
@@ -456,24 +546,20 @@ class HUDRenderer:
         cv2.addWeighted(frame, 1.0, tint, 0.30, 0, frame)
         cv2.rectangle(frame, (x1, y1), (x2, y2), colour, thick)
 
-        lines = [
-            f"{obj.label}  {obj.distance_m:.1f}m",
+        dist_p = _distance_phrase(obj.distance_m, self.cfg)
+        lines  = [
+            f"{obj.label}  {dist_p} ({obj.distance_m:.1f}m)",
             f"TTC {obj.ttc_s:.1f}s  risk {threat.score:.0f}",
-            threat.direction,   # show full direction phrase on HUD
+            threat.direction,
         ]
         tag_h = 18
         for li, txt in enumerate(lines):
             ty = y1 - (len(lines) - li) * tag_h
-            (tw, _), _ = cv2.getTextSize(
-                txt, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1
-            )
-            cv2.rectangle(
-                frame, (x1, ty - 1), (x1 + tw + 4, ty + tag_h - 2), colour, -1
-            )
-            cv2.putText(
-                frame, txt, (x1 + 2, ty + tag_h - 5),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 0, 0), 1, cv2.LINE_AA,
-            )
+            (tw, _), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
+            cv2.rectangle(frame, (x1, ty - 1),
+                          (x1 + tw + 4, ty + tag_h - 2), colour, -1)
+            cv2.putText(frame, txt, (x1 + 2, ty + tag_h - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 0, 0), 1, cv2.LINE_AA)
 
         bar_w = int((x2 - x1) * max(threat.obj.path_intersection, 0))
         if bar_w > 0:
@@ -483,27 +569,20 @@ class HUDRenderer:
         overlay = frame.copy()
         cv2.rectangle(overlay, (0, 0), (w, 58), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
-        cv2.putText(
-            frame, text, (12, 40),
-            cv2.FONT_HERSHEY_DUPLEX, 0.78, colour, 1, cv2.LINE_AA,
-        )
+        cv2.putText(frame, text, (12, 40), cv2.FONT_HERSHEY_DUPLEX,
+                    0.72, colour, 1, cv2.LINE_AA)
 
     def _draw_stats(self, frame, fps, frame_id, perc, threats, w, h):
         overlay = frame.copy()
         cv2.rectangle(overlay, (0, h - 36), (w, h), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.50, frame, 0.50, 0, frame)
         stats = (
-            f"frame {frame_id}"
-            f"  |  fps {fps:.1f}"
-            f"  |  threats {len(threats)}"
-            f"  |  horizon {perc.horizon_y}px"
-            f"  |  scale {perc.depth_scale:.2f}"
+            f"frame {frame_id}  |  fps {fps:.1f}  |  threats {len(threats)}"
+            f"  |  horizon {perc.horizon_y}px  |  scale {perc.depth_scale:.2f}"
             f"  |  infer {perc.inference_ms:.0f}ms"
         )
-        cv2.putText(
-            frame, stats, (8, h - 12),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 180, 180), 1, cv2.LINE_AA,
-        )
+        cv2.putText(frame, stats, (8, h - 12), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.38, (180, 180, 180), 1, cv2.LINE_AA)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -511,18 +590,14 @@ class HUDRenderer:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class FrameCapture:
-    """Background thread that keeps the latest frame always available."""
-
     def __init__(self, source):
         self._cap = cv2.VideoCapture(source)
         if not self._cap.isOpened():
             raise RuntimeError(f"Cannot open video source: {source}")
-
         self.width  = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.fps    = self._cap.get(cv2.CAP_PROP_FPS) or 20.0
         self.total  = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
         self._q    = queue.Queue(maxsize=2)
         self._stop = threading.Event()
         self._done = threading.Event()
@@ -563,12 +638,6 @@ class FrameCapture:
 
 @dataclass
 class PipelineState:
-    """
-    Thread-safe shared state between InferenceThread and the render loop.
-
-    FIX-7: List fields use field(default_factory=list) so dataclass
-           initialises them as empty lists instead of sharing a None sentinel.
-    """
     threats:  List[ThreatRecord]          = field(default_factory=list)
     objects:  List[Object3D]              = field(default_factory=list)
     corridor: Optional[CorridorTrapezoid] = None
@@ -583,25 +652,20 @@ class PipelineState:
 
 class InferenceThread:
     """
-    Runs: Perception → SpatialAnalyzer → RiskEngine → GuidanceSystem.
-    Writes results to PipelineState for the render thread to consume.
-
-    Note: generate_speak() now receives the full threats list (not just top)
-    so GuidanceSystem can issue secondary alerts.  (FIX-12)
+    FIX-15: After spatial analysis, stationary objects inside the corridor
+    receive a minimum closing velocity equal to the user's own walking speed.
+    This ensures they are never silently dropped below TIER_LOW.
     """
 
     def __init__(self, cfg, width, height, tts, state: PipelineState):
         self.cfg   = cfg
         self.state = state
         self.tts   = tts
-
         CFG.compute_intrinsics(width, height)
-
         self.perc    = Perception(cfg, width, height)
         self.spatial = SpatialAnalyzerV3(cfg, height, width)
         self.engine  = RiskEngineV3(cfg)
         self.guide   = GuidanceSystem(cfg)
-
         self._stop = threading.Event()
         self._t    = threading.Thread(target=self._run, daemon=True)
 
@@ -614,6 +678,20 @@ class InferenceThread:
         self.perc.stop()
         self._t.join(timeout=5.0)
 
+    def _apply_stationary_floor(self, objects: List[Object3D]) -> None:
+        """
+        For stationary objects that overlap the walking corridor, inject a
+        minimum closing velocity to represent the user's own approach speed.
+        Without this, a person standing directly in the user's path scores
+        near zero because vz ≈ 0, producing a false "path clear" output.
+        """
+        floor = self.cfg.risk.stationary_vel_floor
+        for obj in objects:
+            if obj.is_stationary and obj.path_intersection > 0.05:
+                vx, vy, vz = obj.velocity
+                if abs(vz) < floor:
+                    obj.velocity = (vx, vy, -floor)
+
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
@@ -623,12 +701,10 @@ class InferenceThread:
 
             perc_out          = self.perc.process(frame)
             objects, corridor = self.spatial.analyze(perc_out)
+            self._apply_stationary_floor(objects)          # FIX-15
             threats           = self.engine.evaluate_all(objects)
-            top               = threats[0] if threats else None
-
-            # FIX-12: pass full list so secondary alerts can fire
-            speak = self.guide.generate_speak(threats)
-            hud   = self.guide.hud_text(top)
+            speak             = self.guide.generate_speak(threats)
+            hud               = self.guide.hud_text(threats)
 
             if speak:
                 self.tts.speak(speak)
@@ -673,7 +749,6 @@ def run(
     fourcc   = cv2.VideoWriter_fourcc(*CFG.pipeline.output_fourcc)
     writer   = cv2.VideoWriter(out_path, fourcc, src_fps, (W, H))
 
-    # FIX-6: always returns an object with a safe speak() method
     tts   = _make_tts(tts_enabled, CFG.guidance.tts_rate)
     state = PipelineState()
     hud   = HUDRenderer(CFG, show_depth, show_heatmap, show_corridor)
@@ -682,7 +757,6 @@ def run(
     inf_t   = InferenceThread(CFG, W, H, tts, state)
     inf_t.start(infer_q)
 
-    # ── Warmup: feed first frame and wait for first PerceptionOutput ──────
     log.info("Feeding first frame — waiting for AI models to initialise…")
     first_frame = cap.read()
     if first_frame is not None:
@@ -690,7 +764,7 @@ def run(
 
     max_wait = 120
     start_t  = time.time()
-    last_log = -1   # FIX-10: track last second we logged to avoid spam
+    last_log = -1
 
     while True:
         with state.lock:
@@ -698,23 +772,16 @@ def run(
         if ready:
             log.info("AI Engine online — starting main loop.")
             break
-
         elapsed = int(time.time() - start_t)
         if elapsed >= max_wait:
             log.error("AI warmup timed out. Exiting.")
-            inf_t.stop()
-            cap.stop()
-            writer.release()
+            inf_t.stop(); cap.stop(); writer.release()
             return
-
-        # FIX-10: only print every 5 seconds, not every loop iteration
         if elapsed % 5 == 0 and elapsed != last_log:
             last_log = elapsed
             log.info(f"  ...loading models ({elapsed}s elapsed)…")
-
         time.sleep(0.25)
 
-    # ── Main render loop ──────────────────────────────────────────────────
     frame_id   = 0
     fps_smooth = 0.0
     t_last     = time.perf_counter()
@@ -752,10 +819,8 @@ def run(
                 )
             else:
                 rendered = frame.copy()
-                cv2.putText(
-                    rendered, "Initialising perception…", (20, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 200, 200), 2,
-                )
+                cv2.putText(rendered, "Initialising perception…", (20, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 200, 200), 2)
 
             writer.write(rendered)
 
@@ -766,23 +831,15 @@ def run(
 
             frame_id += 1
             if frame_id % 150 == 0:
-                pct = (
-                    f"{frame_id / max(cap.total, 1) * 100:.1f}%"
-                    if cap.total > 0
-                    else f"f{frame_id}"
-                )
-                log.info(
-                    f"  [{pct}]  fps={fps_smooth:.1f}"
-                    f"  threats={len(threats)}"
-                    f"  skip={ai_skip}"
-                )
+                pct = (f"{frame_id / max(cap.total, 1) * 100:.1f}%"
+                       if cap.total > 0 else f"f{frame_id}")
+                log.info(f"  [{pct}]  fps={fps_smooth:.1f}"
+                         f"  threats={len(threats)}  skip={ai_skip}")
 
     except KeyboardInterrupt:
         log.info("Interrupted.")
     finally:
-        inf_t.stop()
-        cap.stop()
-        writer.release()
+        inf_t.stop(); cap.stop(); writer.release()
         if show_window:
             cv2.destroyAllWindows()
         log.info(f"Saved to {out_path}")
