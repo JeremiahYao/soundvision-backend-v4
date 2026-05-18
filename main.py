@@ -28,6 +28,12 @@ Fixes applied vs. previous version
   FIX-15  Stationary-obstacle velocity floor: stationary objects inside
           the corridor get a minimum closing velocity equal to the user's
           own walking speed, so they are never silently ignored.
+  FIX-16  Startup voice: speaks "SoundVision starting. Please wait." on
+          launch and "System ready. Path monitoring active." when AI is
+          online. Speaks "System stopped." on shutdown.
+  FIX-17  Bluetooth audio routing: TTSEngine automatically routes audio
+          to the paired Bluetooth earpiece on Linux/Jetson using PulseAudio.
+          Falls back silently if Bluetooth is not connected yet.
 
 Usage
 ------
@@ -41,6 +47,7 @@ from __future__ import annotations
 import argparse
 import logging
 import queue
+import subprocess
 import threading
 import time
 from collections import Counter
@@ -97,15 +104,8 @@ def _distance_phrase(dist_m: float, cfg: Config) -> str:
 def _avoidance_instruction(threats: List[ThreatRecord]) -> str:
     """
     Generate a short, actionable instruction based on the spatial layout
-    of ALL active threats. This answers "what should I do?" not just "what's there?".
-
-    Strategy:
-      - If path blocked left AND right → "Stop — path blocked."
-      - If threats mostly left         → "Move right."
-      - If threats mostly right        → "Move left."
-      - Single centred CRITICAL        → "Stop."
-      - HIGH centred, close            → "Slow down."
-      - Otherwise                      → "" (description is sufficient)
+    of ALL active threats. This answers "what should I do?" not just
+    "what's there?".
 
     lateral_m convention: negative = left of user, positive = right.
     """
@@ -156,9 +156,8 @@ def _scene_summary(threats: List[ThreatRecord], cfg: Config) -> str:
     Fires only when there are 2+ threats at MEDIUM or above.
 
     Examples:
-      "3 people in your path."
+      "3 people close."
       "Person and bicycle close."
-      "2 people close, car nearby."
     """
     significant = [
         t for t in threats
@@ -330,7 +329,6 @@ class GuidanceSystem:
             return None
 
         self._prev_top_sev = top.severity
-
         parts = [p for p in [scene, primary, secondary] if p]
         return "  ".join(parts)
 
@@ -404,34 +402,119 @@ class GuidanceSystem:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TTS Engine
+# TTS Engine  (FIX-16 + FIX-17)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _route_audio_to_bluetooth() -> bool:
+    """
+    FIX-17: Route PulseAudio output to the paired Bluetooth earpiece.
+
+    On Linux/Jetson, paired Bluetooth audio devices appear as a PulseAudio
+    sink named "bluez_sink.*". This function finds that sink and sets it as
+    the default, so pyttsx3 speech goes to the earpiece automatically.
+
+    Returns True if routing succeeded, False if no Bluetooth sink found.
+    This is called once at startup and silently ignored if BT is not yet
+    connected — the systemd service waits 5 s for BT before launching,
+    so by the time this runs the earpiece should be connected.
+    """
+    try:
+        # List all PulseAudio sinks
+        result = subprocess.run(
+            ["pactl", "list", "short", "sinks"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        sinks = result.stdout.strip().splitlines()
+
+        # Find the Bluetooth sink (named bluez_sink.XX_XX_XX_XX_XX_XX.*)
+        bt_sink = None
+        for line in sinks:
+            parts = line.split()
+            if len(parts) >= 2 and "bluez_sink" in parts[1]:
+                bt_sink = parts[1]
+                break
+
+        if bt_sink is None:
+            log.warning("[TTS] No Bluetooth sink found — audio goes to default output.")
+            return False
+
+        # Set as default sink
+        subprocess.run(
+            ["pactl", "set-default-sink", bt_sink],
+            capture_output=True,
+            timeout=3,
+        )
+        log.info(f"[TTS] Audio routed to Bluetooth sink: {bt_sink}")
+        return True
+
+    except FileNotFoundError:
+        # pactl not available — not on Linux, or PulseAudio not installed
+        log.info("[TTS] pactl not found — skipping Bluetooth routing (non-Linux system).")
+        return False
+    except Exception as e:
+        log.warning(f"[TTS] Bluetooth routing failed: {e}")
+        return False
+
+
 class _NullTTS:
+    """Silent stub used when tts_enabled=False."""
     def speak(self, text: str) -> None:
         print(f"[AUDIO] {text}")
 
 
 class TTSEngine:
+    """
+    Live TTS using pyttsx3.
+
+    FIX-17: On startup, automatically routes audio to the paired Bluetooth
+    earpiece using PulseAudio. Falls back to default audio output silently
+    if no Bluetooth device is connected.
+
+    FIX-16: Exposes speak() immediately — startup messages can be queued
+    before the background thread finishes initialising pyttsx3.
+    """
+
     def __init__(self, rate: int = 145):
         self._q: queue.Queue = queue.Queue(maxsize=3)
-        self._engine = None
+        self._engine         = None
+
+        # FIX-17: route audio to Bluetooth BEFORE initialising pyttsx3
+        # so pyttsx3 picks up the correct default sink from PulseAudio.
+        _route_audio_to_bluetooth()
+
         try:
             import pyttsx3
             self._engine = pyttsx3.init()
             self._engine.setProperty("rate", rate)
-            log.info("[TTS] pyttsx3 ready.")
-        except Exception:
-            log.warning("[TTS] pyttsx3 unavailable — silent mode.")
+
+            # Pick the clearest available English voice
+            voices = self._engine.getProperty("voices")
+            if voices:
+                # Prefer a voice with "english" in its ID/name if available
+                english_voice = next(
+                    (v for v in voices if "english" in v.id.lower()), voices[0]
+                )
+                self._engine.setProperty("voice", english_voice.id)
+                log.info(f"[TTS] Voice: {english_voice.id}")
+
+            log.info(f"[TTS] pyttsx3 ready at {rate} wpm.")
+        except Exception as e:
+            log.warning(f"[TTS] pyttsx3 unavailable ({e}) — silent mode.")
+
         threading.Thread(target=self._run, daemon=True).start()
 
     def speak(self, text: str) -> None:
+        """Queue a message for speech. Drops silently if queue is full."""
         if not text:
             return
         try:
             self._q.put_nowait(text)
         except queue.Full:
-            pass
+            # Safety > completeness: if already speaking, drop rather than queue up
+            # a backlog that would play out long after the situation has changed.
+            log.debug(f"[TTS] Queue full — dropped: {text[:40]}")
 
     def _run(self) -> None:
         while True:
@@ -440,8 +523,9 @@ class TTSEngine:
                 try:
                     self._engine.say(text)
                     self._engine.runAndWait()
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.warning(f"[TTS] Speech error: {e}")
+                    print(f"[AUDIO] {text}")
             else:
                 print(f"[AUDIO] {text}")
 
@@ -590,6 +674,8 @@ class HUDRenderer:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class FrameCapture:
+    """Background thread that keeps the latest frame always available."""
+
     def __init__(self, source):
         self._cap = cv2.VideoCapture(source)
         if not self._cap.isOpened():
@@ -638,6 +724,7 @@ class FrameCapture:
 
 @dataclass
 class PipelineState:
+    """Thread-safe shared state between InferenceThread and the render loop."""
     threats:  List[ThreatRecord]          = field(default_factory=list)
     objects:  List[Object3D]              = field(default_factory=list)
     corridor: Optional[CorridorTrapezoid] = None
@@ -652,9 +739,11 @@ class PipelineState:
 
 class InferenceThread:
     """
-    FIX-15: After spatial analysis, stationary objects inside the corridor
-    receive a minimum closing velocity equal to the user's own walking speed.
-    This ensures they are never silently dropped below TIER_LOW.
+    Runs: Perception → SpatialAnalyzer → RiskEngine → GuidanceSystem.
+
+    FIX-15: Stationary objects inside the corridor receive a minimum closing
+    velocity equal to the user's own walking speed before risk evaluation,
+    so they are never silently dropped below TIER_LOW.
     """
 
     def __init__(self, cfg, width, height, tts, state: PipelineState):
@@ -666,8 +755,8 @@ class InferenceThread:
         self.spatial = SpatialAnalyzerV3(cfg, height, width)
         self.engine  = RiskEngineV3(cfg)
         self.guide   = GuidanceSystem(cfg)
-        self._stop = threading.Event()
-        self._t    = threading.Thread(target=self._run, daemon=True)
+        self._stop   = threading.Event()
+        self._t      = threading.Thread(target=self._run, daemon=True)
 
     def start(self, frame_queue: queue.Queue) -> None:
         self._fq = frame_queue
@@ -680,10 +769,10 @@ class InferenceThread:
 
     def _apply_stationary_floor(self, objects: List[Object3D]) -> None:
         """
-        For stationary objects that overlap the walking corridor, inject a
-        minimum closing velocity to represent the user's own approach speed.
-        Without this, a person standing directly in the user's path scores
-        near zero because vz ≈ 0, producing a false "path clear" output.
+        FIX-15: For stationary objects overlapping the walking corridor,
+        inject a minimum closing velocity representing the user's own
+        approach speed. Without this, a person standing in the user's
+        path scores near zero because vz ≈ 0.
         """
         floor = self.cfg.risk.stationary_vel_floor
         for obj in objects:
@@ -701,7 +790,7 @@ class InferenceThread:
 
             perc_out          = self.perc.process(frame)
             objects, corridor = self.spatial.analyze(perc_out)
-            self._apply_stationary_floor(objects)          # FIX-15
+            self._apply_stationary_floor(objects)
             threats           = self.engine.evaluate_all(objects)
             speak             = self.guide.generate_speak(threats)
             hud               = self.guide.hud_text(threats)
@@ -749,7 +838,11 @@ def run(
     fourcc   = cv2.VideoWriter_fourcc(*CFG.pipeline.output_fourcc)
     writer   = cv2.VideoWriter(out_path, fourcc, src_fps, (W, H))
 
-    tts   = _make_tts(tts_enabled, CFG.guidance.tts_rate)
+    # ── TTS init + startup voice  (FIX-16) ───────────────────────────────
+    tts = _make_tts(tts_enabled, CFG.guidance.tts_rate)
+    tts.speak("SoundVision starting. Please wait.")
+    log.info("Startup message queued.")
+
     state = PipelineState()
     hud   = HUDRenderer(CFG, show_depth, show_heatmap, show_corridor)
 
@@ -771,10 +864,14 @@ def run(
             ready = state.perc is not None
         if ready:
             log.info("AI Engine online — starting main loop.")
+            # ── System ready voice  (FIX-16) ─────────────────────────────
+            tts.speak("System ready. Path monitoring active.")
             break
         elapsed = int(time.time() - start_t)
         if elapsed >= max_wait:
             log.error("AI warmup timed out. Exiting.")
+            tts.speak("System error. Please restart the device.")
+            time.sleep(3)   # give TTS time to finish speaking before exit
             inf_t.stop(); cap.stop(); writer.release()
             return
         if elapsed % 5 == 0 and elapsed != last_log:
@@ -838,8 +935,14 @@ def run(
 
     except KeyboardInterrupt:
         log.info("Interrupted.")
+
     finally:
-        inf_t.stop(); cap.stop(); writer.release()
+        # ── Shutdown voice  (FIX-16) ──────────────────────────────────────
+        tts.speak("System stopped.")
+        time.sleep(2)   # give TTS time to finish before process exits
+        inf_t.stop()
+        cap.stop()
+        writer.release()
         if show_window:
             cv2.destroyAllWindows()
         log.info(f"Saved to {out_path}")
