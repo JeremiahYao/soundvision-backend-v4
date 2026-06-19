@@ -272,6 +272,7 @@ class Config:
     pipeline:    PipelineConfig    = field(default_factory=PipelineConfig)
     text_reader: TextReaderConfig  = field(default_factory=TextReaderConfig)
     voice:       VoiceConfig       = field(default_factory=VoiceConfig)
+    navigation:  NavigationConfig  = field(default_factory=NavigationConfig)
 
     # Derived pixel-space camera intrinsics (set by compute_intrinsics)
     fx: float = 0.0
@@ -288,3 +289,31 @@ class Config:
 
 # Pipeline-wide singleton — import this from all modules
 CFG = Config()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Navigation  (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class NavigationConfig:
+    """
+    Google Maps navigation configuration.
+
+    gps_port:
+        Serial port for USB GPS receiver.
+        Windows: "COM3", "COM4" etc. (check Device Manager)
+        Linux:   "/dev/ttyUSB0" or "/dev/ttyACM0"
+        Leave empty ("") for auto-detection.
+
+    update_interval_s:
+        How often the navigation loop checks GPS and announces instructions.
+        2 seconds is a good balance between responsiveness and battery use.
+
+    region_bias:
+        Google Maps region code. "sg" biases results toward Singapore.
+    """
+    gps_port:          str   = ""       # empty = auto-detect
+    gps_baudrate:      int   = 9600
+    update_interval_s: float = 2.0
+    region_bias:       str   = "sg"
