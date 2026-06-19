@@ -54,6 +54,7 @@ from spatial_v3 import SpatialAnalyzerV3, Object3D, CorridorTrapezoid
 from risk_engine_v3 import RiskEngineV3, ThreatRecord, Severity
 from text_reader import TextReader         # NEW
 from voice_control import VoiceController  # NEW
+from navigation import NavigationManager    # NEW
 
 logging.basicConfig(
     level=logging.INFO,
@@ -691,13 +692,16 @@ def run(
     hud   = HUDRenderer(CFG, show_depth, show_heatmap, show_corridor)
 
     # ── Text reader + voice controller  (NEW) ─────────────────────────────
-    text_reader = TextReader(CFG, tts)
-    voice_ctrl  = VoiceController(
+    text_reader  = TextReader(CFG, tts)
+    nav_manager  = NavigationManager(CFG, tts, state)  # NEW
+    nav_manager.start()                                 # NEW — starts USB GPS probe
+    voice_ctrl   = VoiceController(
         cfg         = CFG,
         tts         = tts,
         text_reader = text_reader,
         state       = state,
-        on_navigate = None,   # Plug in navigation.py callback here later
+        on_navigate = nav_manager.start_route,  # NEW — wired to navigation
+        on_stop_nav = nav_manager.stop_route,   # NEW — "stop" cancels route
     )
     voice_ctrl.start()
 
@@ -794,6 +798,7 @@ def run(
         tts.speak("System stopped.")
         time.sleep(2)
         voice_ctrl.stop()
+        nav_manager.stop_route()   # NEW
         inf_t.stop()
         cap.stop()
         writer.release()
