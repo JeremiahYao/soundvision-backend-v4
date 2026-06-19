@@ -119,12 +119,14 @@ class VoiceController:
         text_reader,
         state,
         on_navigate: Optional[Callable[[str], None]] = None,
+        on_stop_nav: Optional[Callable[[], None]] = None,
     ):
         self._cfg          = cfg
         self._tts          = tts
         self._text_reader  = text_reader
         self._state        = state
         self._on_navigate  = on_navigate
+        self._on_stop_nav  = on_stop_nav
         self._model        = None
         self._model_ready  = False
         self._recording    = False
@@ -308,7 +310,10 @@ class VoiceController:
         self._tts.speak(msg)
 
     def _cmd_stop(self) -> None:
-        self._tts.speak("Okay.")
+        if self._on_stop_nav:
+            self._on_stop_nav()   # cancel active navigation route if any
+        else:
+            self._tts.speak("Okay.")
 
     def _cmd_navigate(self, text: str) -> None:
         """Extract destination and call the navigation callback."""
