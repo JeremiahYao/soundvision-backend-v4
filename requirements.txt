@@ -25,4 +25,6 @@ psutil               # Battery level reading
 pyttsx3              # Text-to-speech (uses OS voices, no internet needed)
 
 # ── Navigation  (add later when you have the API key) ────────────────────
-# requests           # HTTP calls to Google Maps API
+requests           # HTTP calls to Google Maps API (navigation)
+pyserial           # USB GPS receiver serial communication
+pynmea2            # Parse NMEA GPS sentences from USB receiver
