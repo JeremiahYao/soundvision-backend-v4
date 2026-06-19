@@ -1,45 +1,35 @@
 """
 main.py — SoundVision V3
 ==========================
-High-performance asynchronous pipeline:
+High-performance asynchronous pipeline.
 
-  FrameCapture Thread  →  infer_q  →  InferenceThread
-                                            ↓
-                                   Perception → Spatial → Risk → Guidance
-                                            ↓
-                                   PipelineState (thread-safe)
-                                            ↓
-  Main Thread reads PipelineState → HUDRenderer → VideoWriter
-
-Fixes applied vs. previous version
----------------------------------------
-  FIX-6   TTSEngine: proper NullTTS stub — speak() always safe.
-  FIX-7   PipelineState: List fields use field(default_factory=list).
-  FIX-10  Warmup log spam suppressed.
-  FIX-11  Templates rewritten for correct grammar with motion-aware
-          direction phrases.
-  FIX-12  Secondary-threat audio for simultaneous CRITICAL/HIGH threats.
-  FIX-13  "Path clear" suppressed during brief tracking gaps.
-  FIX-14  Navigation-grade audio:
-           - Relatable distance language ("arm's reach", "2 steps")
-           - Multi-obstacle count ("3 people blocking your path")
-           - Avoidance instruction ("move right", "stop and wait")
-           - Scene summary for situational awareness
-  FIX-15  Stationary-obstacle velocity floor: stationary objects inside
-          the corridor get a minimum closing velocity equal to the user's
-          own walking speed, so they are never silently ignored.
-  FIX-16  Startup voice: speaks "SoundVision starting. Please wait." on
-          launch and "System ready. Path monitoring active." when AI is
-          online. Speaks "System stopped." on shutdown.
-  FIX-17  Bluetooth audio routing: TTSEngine automatically routes audio
-          to the paired Bluetooth earpiece on Linux/Jetson using PulseAudio.
-          Falls back silently if Bluetooth is not connected yet.
+New in this version (vs previous):
+  FEATURE-1  TextReader integrated — press F1 then say "read this" to
+             read visible text aloud using EasyOCR.
+  FEATURE-2  VoiceController integrated — F1 hotkey activates voice input.
+             Commands: read, repeat, help, battery, stop, navigate to.
+  FEATURE-3  PipelineState now stores current_frame (for text reading)
+             and last_alert (for the "repeat" voice command).
+  FEATURE-4  target_ai_fps lowered to 5.0 in config for laptop CPU testing.
+             Raise back to 10.0 in config.py when running on Jetson GPU.
 
 Usage
 ------
   python main.py  path/to/video.mp4  result_name
   python main.py  0                  live  --show
   python main.py  video.mp4  out  --no-tts --no-depth-overlay
+
+Hotkeys (during laptop testing)
+  F1          → activate voice command (speak within 4 seconds)
+  Q           → quit (when --show window is open)
+
+Voice commands
+  "read this"         → reads text in camera frame
+  "repeat"            → repeats last obstacle alert
+  "help"              → lists available commands
+  "battery"           → announces battery percentage
+  "stop"              → cancels current operation
+  "navigate to [X]"   → (ready when navigation.py is built)
 """
 
 from __future__ import annotations
@@ -62,6 +52,8 @@ from config import CFG, Config
 from perception import Perception, PerceptionOutput
 from spatial_v3 import SpatialAnalyzerV3, Object3D, CorridorTrapezoid
 from risk_engine_v3 import RiskEngineV3, ThreatRecord, Severity
+from text_reader import TextReader         # NEW
+from voice_control import VoiceController  # NEW
 
 logging.basicConfig(
     level=logging.INFO,
@@ -72,25 +64,10 @@ log = logging.getLogger("SV3.Main")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Human-relatable distance language  (FIX-14)
+# Human-relatable distance language
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _distance_phrase(dist_m: float, cfg: Config) -> str:
-    """
-    Convert a metric distance to a human-relatable spoken phrase.
-
-    Uses the DISTANCE_PHRASES config dict (sorted by upper bound).
-    Beyond the largest key: returns "far ahead".
-
-    Examples:
-      0.5 m → "right in front of you"
-      1.0 m → "very close"
-      1.8 m → "close"
-      3.0 m → "nearby"
-      5.0 m → "ahead"
-      9.0 m → "in the distance"
-     20.0 m → "far ahead"
-    """
     for upper_m, phrase in sorted(cfg.guidance.DISTANCE_PHRASES.items()):
         if dist_m <= upper_m:
             return phrase
@@ -98,24 +75,15 @@ def _distance_phrase(dist_m: float, cfg: Config) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Avoidance instruction generator  (FIX-14)
+# Avoidance instruction
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _avoidance_instruction(threats: List[ThreatRecord]) -> str:
-    """
-    Generate a short, actionable instruction based on the spatial layout
-    of ALL active threats. This answers "what should I do?" not just
-    "what's there?".
-
-    lateral_m convention: negative = left of user, positive = right.
-    """
     if not threats:
         return ""
-
     left_count   = sum(1 for t in threats if t.obj.lateral_m < -0.25)
     right_count  = sum(1 for t in threats if t.obj.lateral_m >  0.25)
     centre_count = sum(1 for t in threats if abs(t.obj.lateral_m) <= 0.25)
-
     top_sev  = threats[0].severity
     top_dist = threats[0].distance_m
 
@@ -127,7 +95,6 @@ def _avoidance_instruction(threats: List[ThreatRecord]) -> str:
         if right_count > 0:
             return "Move left."
         return "Stop."
-
     if top_sev == Severity.HIGH:
         if left_count > right_count:
             return "Bear right."
@@ -136,36 +103,25 @@ def _avoidance_instruction(threats: List[ThreatRecord]) -> str:
         if centre_count >= 1 and top_dist < 2.0:
             return "Slow down."
         return "Caution."
-
     if top_sev == Severity.MEDIUM:
         if left_count > right_count and right_count == 0:
             return "Keep right."
         if right_count > left_count and left_count == 0:
             return "Keep left."
-
     return ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Multi-obstacle scene summary  (FIX-14)
+# Multi-obstacle scene summary
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _scene_summary(threats: List[ThreatRecord], cfg: Config) -> str:
-    """
-    Compact spoken scene description when multiple threats exist.
-    Fires only when there are 2+ threats at MEDIUM or above.
-
-    Examples:
-      "3 people close."
-      "Person and bicycle close."
-    """
     significant = [
         t for t in threats
         if t.severity in (Severity.CRITICAL, Severity.HIGH, Severity.MEDIUM)
     ]
     if len(significant) < 2:
         return ""
-
     counts: Counter = Counter(t.obj.label for t in significant)
     parts = []
     for label, count in counts.most_common():
@@ -175,20 +131,18 @@ def _scene_summary(threats: List[ThreatRecord], cfg: Config) -> str:
             parts.append(f"{count} {label}")
         else:
             parts.append(f"{count} {label}s")
-
     if len(parts) == 1:
         label_str = parts[0]
     elif len(parts) == 2:
         label_str = f"{parts[0]} and {parts[1]}"
     else:
         label_str = ", ".join(parts[:-1]) + f", and {parts[-1]}"
-
     dist_phrase = _distance_phrase(significant[0].distance_m, cfg)
     return f"{label_str} {dist_phrase}."
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Alert templates  (FIX-11 + FIX-14)
+# Alert templates
 # ─────────────────────────────────────────────────────────────────────────────
 
 TEMPLATES = {
@@ -240,12 +194,8 @@ def _fmt_ttc(ttc_s: float) -> str:
     return ""
 
 
-def _render_template(
-    template: str,
-    threat: ThreatRecord,
-    dist_phrase: str,
-    action: str,
-) -> str:
+def _render_template(template: str, threat: ThreatRecord,
+                     dist_phrase: str, action: str) -> str:
     rendered = template.format(
         label       = threat.obj.label,
         direction   = threat.direction,
@@ -266,42 +216,27 @@ def _render_template(
 # ─────────────────────────────────────────────────────────────────────────────
 
 class GuidanceSystem:
-    """
-    Decides what to speak and when, based on the ranked threat list.
-
-    Full spoken output structure (FIX-14):
-      [scene summary if 2+ threats]  →  [primary alert + action]  →  [secondary]
-
-    Example:
-      "2 people and a bicycle close.
-       Stop! Person ahead, approaching fast. Move right.
-       Also: bicycle on your left."
-    """
-
     _CLEAR_MIN_SEVERITY       = {Severity.MEDIUM, Severity.HIGH, Severity.CRITICAL}
     _SCENE_SUMMARY_COOLDOWN_S = 10.0
 
     def __init__(self, cfg: Config):
-        self.cfg                    = cfg
-        self._cooldown:      Dict   = {}
-        self._tpl_idx:       Dict   = {}
-        self._last_sev:      Dict   = {}
-        self._secondary_cd:  Dict   = {}
-        self._spoke_clear           = True
-        self._last_clear_t          = 0.0
-        self._prev_top_sev          = Severity.CLEAR
-        self._last_scene_summary_t  = 0.0
+        self.cfg                   = cfg
+        self._cooldown:     Dict   = {}
+        self._tpl_idx:      Dict   = {}
+        self._last_sev:     Dict   = {}
+        self._secondary_cd: Dict   = {}
+        self._spoke_clear          = True
+        self._last_clear_t         = 0.0
+        self._prev_top_sev         = Severity.CLEAR
+        self._last_scene_summary_t = 0.0
 
     def generate_speak(self, threats: List[ThreatRecord]) -> Optional[str]:
         now = time.monotonic()
         top = threats[0] if threats else None
-
         if top is None:
             return self._maybe_speak_clear(now)
-
         self._spoke_clear = False
 
-        # Scene summary
         scene = ""
         if (
             len(threats) >= 2
@@ -311,11 +246,9 @@ class GuidanceSystem:
             if scene:
                 self._last_scene_summary_t = now
 
-        # Primary
         avoidance = _avoidance_instruction(threats)
         primary   = self._primary_message(top, avoidance, now)
 
-        # Secondary
         secondary = ""
         if primary and len(threats) >= 2:
             secondary = self._secondary_message(threats[1], now)
@@ -343,28 +276,23 @@ class GuidanceSystem:
             return self.cfg.guidance.clear_msg
         return None
 
-    def _primary_message(
-        self, threat: ThreatRecord, avoidance: str, now: float
-    ) -> Optional[str]:
+    def _primary_message(self, threat: ThreatRecord,
+                         avoidance: str, now: float) -> Optional[str]:
         sev = threat.severity
         tid = threat.obj.track_id
-
         prev      = self._last_sev.get(tid, Severity.CLEAR)
         escalated = (
             sev == Severity.CRITICAL
             and prev not in (Severity.CRITICAL, Severity.HIGH)
         )
         self._last_sev[tid] = sev
-
         cooldown = self.cfg.guidance.COOLDOWN_S.get(sev, 5.0)
         if not escalated and (now - self._cooldown.get(tid, 0.0)) < cooldown:
             return None
-
         self._cooldown[tid] = now
         templates = TEMPLATES[sev]
         idx = self._tpl_idx.get(tid, 0) % len(templates)
         self._tpl_idx[tid] = idx + 1
-
         dist_phrase = _distance_phrase(threat.distance_m, self.cfg)
         return _render_template(templates[idx], threat, dist_phrase, avoidance)
 
@@ -378,22 +306,19 @@ class GuidanceSystem:
         self._secondary_cd[tid] = now
         idx  = self._tpl_idx.get(tid, 0) % len(SECONDARY_TEMPLATES)
         return SECONDARY_TEMPLATES[idx].format(
-            label     = threat.obj.label,
-            direction = threat.direction,
+            label=threat.obj.label, direction=threat.direction,
         )
 
     def hud_text(self, threats: List[ThreatRecord]) -> str:
         top = threats[0] if threats else None
         if top is None:
             return f"{SEVERITY_ICON[Severity.CLEAR]} Path clear."
-
         icon      = SEVERITY_ICON.get(top.severity, "")
         ttc_str   = f"  TTC {top.ttc_s:.1f}s" if top.ttc_s < 60 else ""
         trend_str = "↑" if top.trend > 2 else ("↓" if top.trend < -2 else "")
         dist_p    = _distance_phrase(top.distance_m, self.cfg)
         n         = len(threats)
         count_str = f"  ({n} threats)" if n > 1 else ""
-
         return (
             f"{icon} {top.obj.label.upper()} — {top.direction}"
             f"  |  {dist_p} ({top.distance_m:.1f}m){ttc_str}"
@@ -402,56 +327,26 @@ class GuidanceSystem:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TTS Engine  (FIX-16 + FIX-17)
+# TTS Engine
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _route_audio_to_bluetooth() -> bool:
-    """
-    FIX-17: Route PulseAudio output to the paired Bluetooth earpiece.
-
-    On Linux/Jetson, paired Bluetooth audio devices appear as a PulseAudio
-    sink named "bluez_sink.*". This function finds that sink and sets it as
-    the default, so pyttsx3 speech goes to the earpiece automatically.
-
-    Returns True if routing succeeded, False if no Bluetooth sink found.
-    This is called once at startup and silently ignored if BT is not yet
-    connected — the systemd service waits 5 s for BT before launching,
-    so by the time this runs the earpiece should be connected.
-    """
     try:
-        # List all PulseAudio sinks
         result = subprocess.run(
             ["pactl", "list", "short", "sinks"],
-            capture_output=True,
-            text=True,
-            timeout=3,
+            capture_output=True, text=True, timeout=3,
         )
-        sinks = result.stdout.strip().splitlines()
-
-        # Find the Bluetooth sink (named bluez_sink.XX_XX_XX_XX_XX_XX.*)
-        bt_sink = None
-        for line in sinks:
+        for line in result.stdout.strip().splitlines():
             parts = line.split()
             if len(parts) >= 2 and "bluez_sink" in parts[1]:
-                bt_sink = parts[1]
-                break
-
-        if bt_sink is None:
-            log.warning("[TTS] No Bluetooth sink found — audio goes to default output.")
-            return False
-
-        # Set as default sink
-        subprocess.run(
-            ["pactl", "set-default-sink", bt_sink],
-            capture_output=True,
-            timeout=3,
-        )
-        log.info(f"[TTS] Audio routed to Bluetooth sink: {bt_sink}")
-        return True
-
+                subprocess.run(["pactl", "set-default-sink", parts[1]],
+                               capture_output=True, timeout=3)
+                log.info(f"[TTS] Audio routed to Bluetooth: {parts[1]}")
+                return True
+        log.warning("[TTS] No Bluetooth sink found — using default output.")
+        return False
     except FileNotFoundError:
-        # pactl not available — not on Linux, or PulseAudio not installed
-        log.info("[TTS] pactl not found — skipping Bluetooth routing (non-Linux system).")
+        log.info("[TTS] pactl not found — skipping Bluetooth routing (non-Linux).")
         return False
     except Exception as e:
         log.warning(f"[TTS] Bluetooth routing failed: {e}")
@@ -459,61 +354,36 @@ def _route_audio_to_bluetooth() -> bool:
 
 
 class _NullTTS:
-    """Silent stub used when tts_enabled=False."""
     def speak(self, text: str) -> None:
         print(f"[AUDIO] {text}")
 
 
 class TTSEngine:
-    """
-    Live TTS using pyttsx3.
-
-    FIX-17: On startup, automatically routes audio to the paired Bluetooth
-    earpiece using PulseAudio. Falls back to default audio output silently
-    if no Bluetooth device is connected.
-
-    FIX-16: Exposes speak() immediately — startup messages can be queued
-    before the background thread finishes initialising pyttsx3.
-    """
-
     def __init__(self, rate: int = 145):
         self._q: queue.Queue = queue.Queue(maxsize=3)
-        self._engine         = None
-
-        # FIX-17: route audio to Bluetooth BEFORE initialising pyttsx3
-        # so pyttsx3 picks up the correct default sink from PulseAudio.
+        self._engine = None
         _route_audio_to_bluetooth()
-
         try:
             import pyttsx3
             self._engine = pyttsx3.init()
             self._engine.setProperty("rate", rate)
-
-            # Pick the clearest available English voice
             voices = self._engine.getProperty("voices")
             if voices:
-                # Prefer a voice with "english" in its ID/name if available
                 english_voice = next(
                     (v for v in voices if "english" in v.id.lower()), voices[0]
                 )
                 self._engine.setProperty("voice", english_voice.id)
-                log.info(f"[TTS] Voice: {english_voice.id}")
-
             log.info(f"[TTS] pyttsx3 ready at {rate} wpm.")
         except Exception as e:
-            log.warning(f"[TTS] pyttsx3 unavailable ({e}) — silent mode.")
-
+            log.warning(f"[TTS] pyttsx3 unavailable ({e}) — print mode.")
         threading.Thread(target=self._run, daemon=True).start()
 
     def speak(self, text: str) -> None:
-        """Queue a message for speech. Drops silently if queue is full."""
         if not text:
             return
         try:
             self._q.put_nowait(text)
         except queue.Full:
-            # Safety > completeness: if already speaking, drop rather than queue up
-            # a backlog that would play out long after the situation has changed.
             log.debug(f"[TTS] Queue full — dropped: {text[:40]}")
 
     def _run(self) -> None:
@@ -539,32 +409,17 @@ def _make_tts(enabled: bool, rate: int):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class HUDRenderer:
-    def __init__(
-        self,
-        cfg: Config,
-        show_depth:    bool = True,
-        show_heatmap:  bool = True,
-        show_corridor: bool = True,
-    ):
+    def __init__(self, cfg: Config, show_depth=True,
+                 show_heatmap=True, show_corridor=True):
         self.cfg           = cfg
         self.show_depth    = show_depth
         self.show_heatmap  = show_heatmap
         self.show_corridor = show_corridor
 
-    def render(
-        self,
-        frame:    np.ndarray,
-        perc:     PerceptionOutput,
-        objects:  List[Object3D],
-        corridor: Optional[CorridorTrapezoid],
-        threats:  List[ThreatRecord],
-        hud_text: str,
-        fps:      float,
-        frame_id: int,
-    ) -> np.ndarray:
+    def render(self, frame, perc, objects, corridor,
+               threats, hud_text, fps, frame_id):
         out = frame.copy()
         h, w = out.shape[:2]
-
         if self.show_depth and perc.depth_smooth is not None:
             self._overlay_depth(out, perc.depth_smooth, w, h)
         if self.show_heatmap and perc.risk_heatmap is not None:
@@ -577,13 +432,11 @@ class HUDRenderer:
             self._draw_corridor(out, corridor)
         for threat in threats:
             self._draw_obstacle(out, threat)
-
         hy = perc.horizon_y
         cv2.line(out, (0, hy), (w, hy), (200, 200, 0), 1, cv2.LINE_AA)
         cv2.putText(out, f"horizon  roll {perc.roll_deg:+.1f}deg",
                     (8, max(hy - 5, 12)), cv2.FONT_HERSHEY_SIMPLEX,
                     0.38, (200, 200, 0), 1, cv2.LINE_AA)
-
         top_sev    = threats[0].severity if threats else Severity.CLEAR
         banner_col = SEVERITY_BGR.get(top_sev, (60, 60, 60))
         self._draw_banner(out, hud_text, banner_col, w)
@@ -624,12 +477,10 @@ class HUDRenderer:
         colour = SEVERITY_BGR.get(threat.severity, (180, 180, 180))
         x1, y1, x2, y2 = obj.inst.bbox
         thick  = 3 if threat.severity in (Severity.CRITICAL, Severity.HIGH) else 2
-
         tint = np.zeros_like(frame)
         tint[obj.inst.mask] = colour
         cv2.addWeighted(frame, 1.0, tint, 0.30, 0, frame)
         cv2.rectangle(frame, (x1, y1), (x2, y2), colour, thick)
-
         dist_p = _distance_phrase(obj.distance_m, self.cfg)
         lines  = [
             f"{obj.label}  {dist_p} ({obj.distance_m:.1f}m)",
@@ -644,7 +495,6 @@ class HUDRenderer:
                           (x1 + tw + 4, ty + tag_h - 2), colour, -1)
             cv2.putText(frame, txt, (x1 + 2, ty + tag_h - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 0, 0), 1, cv2.LINE_AA)
-
         bar_w = int((x2 - x1) * max(threat.obj.path_intersection, 0))
         if bar_w > 0:
             cv2.rectangle(frame, (x1, y2 + 2), (x1 + bar_w, y2 + 7), colour, -1)
@@ -674,8 +524,6 @@ class HUDRenderer:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class FrameCapture:
-    """Background thread that keeps the latest frame always available."""
-
     def __init__(self, source):
         self._cap = cv2.VideoCapture(source)
         if not self._cap.isOpened():
@@ -724,13 +572,21 @@ class FrameCapture:
 
 @dataclass
 class PipelineState:
-    """Thread-safe shared state between InferenceThread and the render loop."""
-    threats:  List[ThreatRecord]          = field(default_factory=list)
-    objects:  List[Object3D]              = field(default_factory=list)
-    corridor: Optional[CorridorTrapezoid] = None
-    perc:     Optional[PerceptionOutput]  = None
-    hud_text: str                         = "Initialising…"
-    lock:     threading.Lock              = field(default_factory=threading.Lock)
+    """
+    Thread-safe shared state between InferenceThread, VoiceController,
+    and the render loop.
+
+    current_frame : most recent raw camera frame (for TextReader)
+    last_alert    : most recently spoken obstacle alert (for "repeat" command)
+    """
+    threats:       List[ThreatRecord]          = field(default_factory=list)
+    objects:       List[Object3D]              = field(default_factory=list)
+    corridor:      Optional[CorridorTrapezoid] = None
+    perc:          Optional[PerceptionOutput]  = None
+    hud_text:      str                         = "Initialising…"
+    current_frame: Optional[np.ndarray]        = None   # NEW — for TextReader
+    last_alert:    str                         = ""     # NEW — for "repeat" command
+    lock:          threading.Lock              = field(default_factory=threading.Lock)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -738,14 +594,6 @@ class PipelineState:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class InferenceThread:
-    """
-    Runs: Perception → SpatialAnalyzer → RiskEngine → GuidanceSystem.
-
-    FIX-15: Stationary objects inside the corridor receive a minimum closing
-    velocity equal to the user's own walking speed before risk evaluation,
-    so they are never silently dropped below TIER_LOW.
-    """
-
     def __init__(self, cfg, width, height, tts, state: PipelineState):
         self.cfg   = cfg
         self.state = state
@@ -768,12 +616,6 @@ class InferenceThread:
         self._t.join(timeout=5.0)
 
     def _apply_stationary_floor(self, objects: List[Object3D]) -> None:
-        """
-        FIX-15: For stationary objects overlapping the walking corridor,
-        inject a minimum closing velocity representing the user's own
-        approach speed. Without this, a person standing in the user's
-        path scores near zero because vz ≈ 0.
-        """
         floor = self.cfg.risk.stationary_vel_floor
         for obj in objects:
             if obj.is_stationary and obj.path_intersection > 0.05:
@@ -799,11 +641,14 @@ class InferenceThread:
                 self.tts.speak(speak)
 
             with self.state.lock:
-                self.state.perc     = perc_out
-                self.state.objects  = objects
-                self.state.corridor = corridor
-                self.state.threats  = threats
-                self.state.hud_text = hud
+                self.state.perc          = perc_out
+                self.state.objects       = objects
+                self.state.corridor      = corridor
+                self.state.threats       = threats
+                self.state.hud_text      = hud
+                self.state.current_frame = frame.copy()   # NEW — for TextReader
+                if speak:
+                    self.state.last_alert = speak          # NEW — for "repeat"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -838,19 +683,29 @@ def run(
     fourcc   = cv2.VideoWriter_fourcc(*CFG.pipeline.output_fourcc)
     writer   = cv2.VideoWriter(out_path, fourcc, src_fps, (W, H))
 
-    # ── TTS init + startup voice  (FIX-16) ───────────────────────────────
+    # ── TTS + startup voice ───────────────────────────────────────────────
     tts = _make_tts(tts_enabled, CFG.guidance.tts_rate)
     tts.speak("SoundVision starting. Please wait.")
-    log.info("Startup message queued.")
 
     state = PipelineState()
     hud   = HUDRenderer(CFG, show_depth, show_heatmap, show_corridor)
+
+    # ── Text reader + voice controller  (NEW) ─────────────────────────────
+    text_reader = TextReader(CFG, tts)
+    voice_ctrl  = VoiceController(
+        cfg         = CFG,
+        tts         = tts,
+        text_reader = text_reader,
+        state       = state,
+        on_navigate = None,   # Plug in navigation.py callback here later
+    )
+    voice_ctrl.start()
 
     infer_q = queue.Queue(maxsize=2)
     inf_t   = InferenceThread(CFG, W, H, tts, state)
     inf_t.start(infer_q)
 
-    log.info("Feeding first frame — waiting for AI models to initialise…")
+    log.info("Waiting for AI models to initialise…")
     first_frame = cap.read()
     if first_frame is not None:
         infer_q.put(first_frame.copy())
@@ -863,27 +718,27 @@ def run(
         with state.lock:
             ready = state.perc is not None
         if ready:
-            log.info("AI Engine online — starting main loop.")
-            # ── System ready voice  (FIX-16) ─────────────────────────────
+            log.info("AI Engine online.")
             tts.speak("System ready. Path monitoring active.")
+            log.info(f"Press {CFG.voice.trigger_key.upper()} for voice commands.")
             break
         elapsed = int(time.time() - start_t)
         if elapsed >= max_wait:
-            log.error("AI warmup timed out. Exiting.")
+            log.error("AI warmup timed out.")
             tts.speak("System error. Please restart the device.")
-            time.sleep(3)   # give TTS time to finish speaking before exit
+            time.sleep(3)
             inf_t.stop(); cap.stop(); writer.release()
             return
         if elapsed % 5 == 0 and elapsed != last_log:
             last_log = elapsed
-            log.info(f"  ...loading models ({elapsed}s elapsed)…")
+            log.info(f"  ...loading ({elapsed}s)…")
         time.sleep(0.25)
 
     frame_id   = 0
     fps_smooth = 0.0
     t_last     = time.perf_counter()
     ai_skip    = max(1, int(src_fps / CFG.pipeline.target_ai_fps))
-    log.info(f"Running. AI every {ai_skip} frames. Ctrl-C or Q to quit.")
+    log.info(f"Running. AI every {ai_skip} frames. Q to quit.")
 
     try:
         while not cap.done():
@@ -916,7 +771,7 @@ def run(
                 )
             else:
                 rendered = frame.copy()
-                cv2.putText(rendered, "Initialising perception…", (20, 50),
+                cv2.putText(rendered, "Initialising…", (20, 50),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 200, 200), 2)
 
             writer.write(rendered)
@@ -930,16 +785,15 @@ def run(
             if frame_id % 150 == 0:
                 pct = (f"{frame_id / max(cap.total, 1) * 100:.1f}%"
                        if cap.total > 0 else f"f{frame_id}")
-                log.info(f"  [{pct}]  fps={fps_smooth:.1f}"
-                         f"  threats={len(threats)}  skip={ai_skip}")
+                log.info(f"  [{pct}]  fps={fps_smooth:.1f}  "
+                         f"threats={len(threats)}  skip={ai_skip}")
 
     except KeyboardInterrupt:
         log.info("Interrupted.")
-
     finally:
-        # ── Shutdown voice  (FIX-16) ──────────────────────────────────────
         tts.speak("System stopped.")
-        time.sleep(2)   # give TTS time to finish before process exits
+        time.sleep(2)
+        voice_ctrl.stop()
         inf_t.stop()
         cap.stop()
         writer.release()
@@ -953,10 +807,8 @@ def run(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="SoundVision V3 — Segmentation + Depth pedestrian safety"
-    )
-    p.add_argument("video",              help="Input video path or '0' for webcam")
+    p = argparse.ArgumentParser(description="SoundVision V3")
+    p.add_argument("video",              help="Video path or '0' for webcam")
     p.add_argument("output",             help="Output file base name")
     p.add_argument("--show",             action="store_true")
     p.add_argument("--no-tts",           action="store_true")
