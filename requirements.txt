@@ -1,0 +1,28 @@
+# SoundVision V3 — Python dependencies
+# Install all at once: pip install -r requirements.txt
+
+# ── Core AI pipeline ──────────────────────────────────────────────────────
+torch
+torchvision
+ultralytics          # YOLO (yolo11n-seg.pt / yolov8n-seg.pt)
+timm                 # MiDaS depth model dependency
+
+# ── Computer vision ───────────────────────────────────────────────────────
+opencv-python
+numpy
+scipy
+
+# ── Text reading  (new) ───────────────────────────────────────────────────
+easyocr              # OCR — downloads ~200 MB model on first run
+
+# ── Voice control  (new) ─────────────────────────────────────────────────
+openai-whisper       # Speech recognition — downloads ~150 MB on first run
+sounddevice          # Microphone recording
+keyboard             # F1 hotkey detection (works on Windows without sudo)
+psutil               # Battery level reading
+
+# ── Audio output ──────────────────────────────────────────────────────────
+pyttsx3              # Text-to-speech (uses OS voices, no internet needed)
+
+# ── Navigation  (add later when you have the API key) ────────────────────
+# requests           # HTTP calls to Google Maps API
